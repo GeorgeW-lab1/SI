@@ -42,11 +42,12 @@ from typing import Dict, Iterable, List, Sequence, Tuple
 
 import numpy as np
 
-BOS, EOS = "<bos>", ""
+BOS, EOS = "<bos>", "<eos>"
 
 
-f = open(input("Filename: "), "r")
+f = open(input("Filename:"), "r")
 BUILTIN_CORPUS = f.read()
+
 
 # --------------------------------------------------------------------------
 # Symbol sets over the alphabet
@@ -341,7 +342,8 @@ def generate(
         if allowed is not None:
             gated = [(t, lp) for t, lp in ranked if t in allowed]
             ranked = gated or ranked  # never dead-end on the gate
- 
+        if not ranked:
+            break
 
         scored: List[Candidate] = []
         for token, logp in ranked:
@@ -375,7 +377,7 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Character-level generator with symbol-set adiabatic scoring.")
     ap.add_argument("corpus", nargs="?", help="UTF-8 text file; built-in corpus if omitted.")
     ap.add_argument("--prompt", default="Once upon a", help="Initial text context.")
-    ap.add_argument("--tokens", type=int, default=4000, help="Number of new symbols.")
+    ap.add_argument("--tokens", type=int, default=400, help="Number of new symbols.")
     ap.add_argument("--order", type=int, default=5, help="Symbol n-gram order (default 5).")
     ap.add_argument("--alpha", type=float, default=0.25, help="Additive smoothing.")
     ap.add_argument("--beam", type=int, default=8, help="Candidates kept before sampling.")
@@ -440,6 +442,11 @@ def main() -> None:
             print(result, "\n")
     except (EOFError, KeyboardInterrupt):
         print()
+
+
+    if args.save and result:
+        Path(args.save).write_text(result, encoding="utf-8")
+
 
 if __name__ == "__main__":
     main()
