@@ -1,63 +1,171 @@
 """
-Non-isomorphic adiabatic text generator
-=======================================
+Symbol-set adiabatic text generator
+===================================
 
-A runnable corpus-based text generator in which next-token candidates are
-scored by an n-gram language model and filtered/reweighted by several
-non-isomorphic process fragments.
+Character-level version of the non-isomorphic adiabatic generator.
+Tokens are single symbols. The alphabet is a universe U, and every
+"fragment" reasons with sets over U using logical set operations
+(union |, intersection &, xor ^, difference -, complement ~).
 
 Conceptual mapping:
-  F       reference next-token distribution from the n-gram model
-  g_k     fragment-specific transforms of candidate/context features
-  I_k     local approximate inverse/lift (not a global inverse)
-  lambda  smooth adiabatic continuation from exploratory to selective scoring
-  D       proposed "diopathane" consistency score
-  tau     maximum permitted D score for a candidate
+  F       reference next-symbol distribution from the n-gram model
+  g_k     fragment-specific set-valued lifts of (context, candidate)
+            g1: Follow-set space      (subsets of the alphabet)
+            g2: class-signature space (bit-vectors over symbol classes)
+            g3: recent-window space   (subset of the last few symbols)
+  lambda  smooth adiabatic ramp from exploratory to selective scoring
+  D       consistency score (lower = more consistent), built from set ops
+  tau     maximum permitted D for a candidate
 
-This is an experimental algorithmic analogy, not an established physical
-model. "Diopathane" is a user-defined name for the consistency constraint.
+Set-expression gates (optional):
+  --allow  "LETTER | SPACE | END"        only these symbols may be emitted
+  --forbid "DIGIT ^ (DIGIT & '0')"       these symbols are removed
+  Names: ALL LOWER UPPER LETTER VOWEL CONSONANT DIGIT ALNUM SPACE END PAUSE
+         QUOTE BRACKET OTHER PUNCT, plus chars("abc") for a literal set.
 
 Examples:
-  python nonisomorphic_adiabatic_textgen.py corpus.txt --prompt "once upon a" --tokens 80
-  python nonisomorphic_adiabatic_textgen.py --prompt "The machine" --tokens 60
-  python nonisomorphic_adiabatic_textgen.py corpus.txt --order 4 --beam 8 --tau 0.65
+  python symbolset_adiabatic_textgen.py corpus.txt --prompt "Once upon a" --tokens 300
+  python symbolset_adiabatic_textgen.py corpus.txt --allow "LOWER | SPACE | END"
+  python symbolset_adiabatic_textgen.py corpus.txt --interactive --order 6
+  python symbolset_adiabatic_textgen.py corpus.txt --sets
 
 Only dependency: NumPy
-Install: python -m pip install numpy
 """
 
 import argparse
 import math
 import random
-import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, Iterable, List, Sequence, Tuple
 
 import numpy as np
 
-TOKEN_RE = re.compile(r"[A-Za-z]+(?:['’][A-Za-z]+)*|\\d+(?:\\.\\d+)?|[^\\w\\s]", re.UNICODE)
-with open(input("Filename: "), "r", encoding="utf-8") as file:
+BOS, EOS = "<bos>", ""
 
-    BUILTIN_CORPUS = file.read()
+
+f = open(input("Filename: "), "r")
+BUILTIN_CORPUS = f.read()
+
+# --------------------------------------------------------------------------
+# Symbol sets over the alphabet
+# --------------------------------------------------------------------------
+
+class SymbolSpace:
+    """The universe U: an ordered alphabet, with sets stored as bit masks."""
+
+    def __init__(self, alphabet: Iterable[str]):
+        self.symbols: List[str] = sorted(set(alphabet))
+        self.index: Dict[str, int] = {s: i for i, s in enumerate(self.symbols)}
+        self.full_mask: int = (1 << len(self.symbols)) - 1
+
+    def make(self, mask: int) -> "SymbolSet":
+        return SymbolSet(self, mask & self.full_mask)
+
+    def empty(self) -> "SymbolSet":
+        return self.make(0)
+
+    def universe(self) -> "SymbolSet":
+        return self.make(self.full_mask)
+
+    def chars(self, chars: Iterable[str]) -> "SymbolSet":
+        mask = 0
+        for c in chars:
+            if c in self.index:
+                mask |= 1 << self.index[c]
+        return self.make(mask)
+
+    def where(self, predicate) -> "SymbolSet":
+        return self.chars(s for s in self.symbols if predicate(s))
+
+
+class SymbolSet:
+    """Immutable subset of the alphabet with logical set operations."""
+    __slots__ = ("space", "mask")
+
+    def __init__(self, space: SymbolSpace, mask: int):
+        self.space, self.mask = space, mask
+
+    def _check(self, other: "SymbolSet") -> None:
+        if not isinstance(other, SymbolSet) or other.space is not self.space:
+            raise TypeError("set operations require sets from the same alphabet")
+
+    def __or__(self, o):  self._check(o); return self.space.make(self.mask | o.mask)   # union
+    def __and__(self, o): self._check(o); return self.space.make(self.mask & o.mask)   # intersection
+    def __xor__(self, o): self._check(o); return self.space.make(self.mask ^ o.mask)   # symmetric difference
+    def __sub__(self, o): self._check(o); return self.space.make(self.mask & ~o.mask)  # difference
+    def __invert__(self): return self.space.make(~self.mask)                           # complement
+
+    def __contains__(self, symbol: str) -> bool:
+        i = self.space.index.get(symbol)
+        return i is not None and bool((self.mask >> i) & 1)
+
+    def __len__(self) -> int:
+        return bin(self.mask).count("1")
+
+    def __bool__(self) -> bool:
+        return self.mask != 0
+
+    def members(self) -> List[str]:
+        return [s for s in self.space.symbols if s in self]
+
+    def __repr__(self) -> str:
+        return "{" + "".join(repr(s)[1:-1] for s in self.members()) + "}"
+
+
+def build_named_sets(space: SymbolSpace) -> Dict[str, SymbolSet]:
+    """Base classes from predicates; derived classes purely from set operations."""
+    named: Dict[str, SymbolSet] = {}
+    named["ALL"] = space.universe()
+    named["LOWER"] = space.where(str.islower)
+    named["UPPER"] = space.where(str.isupper)
+    named["DIGIT"] = space.where(str.isdigit)
+    named["SPACE"] = space.where(str.isspace)
+    named["VOWEL"] = space.where(lambda c: c.lower() in "aeiou")
+    named["END"] = space.chars(".!?")
+    named["PAUSE"] = space.chars(",;:")
+    named["QUOTE"] = space.chars("\"'`\u2018\u2019\u201c\u201d")
+    named["BRACKET"] = space.chars("()[]{}")
+    # Derived with logical operations:
+    named["LETTER"] = named["LOWER"] | named["UPPER"]
+    named["CONSONANT"] = named["LETTER"] - named["VOWEL"]
+    named["ALNUM"] = named["LETTER"] | named["DIGIT"]
+    named["PUNCT"] = named["ALL"] - named["ALNUM"] - named["SPACE"]
+    named["OTHER"] = named["PUNCT"] - (named["END"] | named["PAUSE"] | named["QUOTE"] | named["BRACKET"])
+    return named
+
+
+def eval_set_expr(expr: str, space: SymbolSpace, named: Dict[str, SymbolSet]) -> SymbolSet:
+    """Evaluate e.g. "LETTER & ~VOWEL | SPACE" with | & ^ - ~ and chars('..')."""
+    env = dict(named)
+    env["chars"] = space.chars
+    try:
+        result = eval(expr, {"__builtins__": {}}, env)  # restricted namespace
+    except Exception as exc:
+        raise ValueError(f"Bad set expression {expr!r}: {exc}")
+    if isinstance(result, str):
+        result = space.chars(result)
+    if not isinstance(result, SymbolSet):
+        raise ValueError(f"Expression {expr!r} did not produce a symbol set")
+    return result
+
+
+# --------------------------------------------------------------------------
+# Tokenisation: single symbols
+# --------------------------------------------------------------------------
 
 def tokenize(text: str) -> List[str]:
-    return text.split()
+    return list(text)
+
 
 def detokenize(tokens: Sequence[str]) -> str:
-    """Join tokens into readable text without spaces before common punctuation."""
-    out = ""
-    no_space_before = set(".,!?;:%)]}»”’")
-    no_space_after = set("([{«“‘")
-    for token in tokens:
-        if not out:
-            out = token
-        elif token in no_space_before or out[-1:] in no_space_after:
-            out += token
-        else:
-            out += " " + token
-    return out
+    return "".join(t for t in tokens if t not in (BOS, EOS))
+
+
+# --------------------------------------------------------------------------
+# N-gram model over symbols
+# --------------------------------------------------------------------------
 
 @dataclass
 class Candidate:
@@ -68,24 +176,24 @@ class Candidate:
     alignment: float
     probability: float = 0.0
 
-class NGramModel:
-    """Smoothed n-gram model with backoff to shorter contexts."""
 
-    def __init__(self, order: int = 3, alpha: float = 0.25):
+class NGramModel:
+    """Smoothed symbol n-gram model with backoff to shorter contexts."""
+
+    def __init__(self, order: int = 5, alpha: float = 0.25):
         self.order = max(1, int(order))
         self.alpha = max(1e-9, float(alpha))
         self.counts = [defaultdict(Counter) for _ in range(self.order)]
         self.vocab = Counter()
-        self.total_tokens = 0
+        self.bigrams = defaultdict(Counter)  # for follow sets
 
     def train(self, text: str) -> None:
-        tokens = ["<bos>"] * (self.order - 1) + tokenize(text) + ["<eos>"]
-        if not tokens:
-            return
+        tokens = [BOS] * (self.order - 1) + tokenize(text) + [EOS]
         for i in range(self.order - 1, len(tokens)):
             target = tokens[i]
             self.vocab[target] += 1
-            self.total_tokens += 1
+            if i > 0:
+                self.bigrams[tokens[i - 1]][target] += 1
             for ctx_len in range(self.order):
                 context = tuple(tokens[i - ctx_len:i]) if ctx_len else ()
                 self.counts[ctx_len][context][target] += 1
@@ -93,8 +201,7 @@ class NGramModel:
     def candidates(self, context_tokens: Sequence[str], limit: int = 80) -> List[Tuple[str, float]]:
         vocab_size = max(1, len(self.vocab))
         context = list(context_tokens)
-        counter = Counter()
-        # Blend backoff levels; a longer context receives more weight.
+        counter: Counter = Counter()
         for ctx_len in range(min(self.order - 1, len(context)), -1, -1):
             key = tuple(context[-ctx_len:]) if ctx_len else ()
             found = self.counts[ctx_len].get(key)
@@ -115,98 +222,93 @@ class NGramModel:
         ranked.sort(key=lambda item: item[1], reverse=True)
         return ranked[:max(1, limit)]
 
-class NonIsomorphicFragments:
+
+# --------------------------------------------------------------------------
+# Non-isomorphic set fragments
+# --------------------------------------------------------------------------
+
+CLASS_ORDER = ["LOWER", "UPPER", "VOWEL", "CONSONANT", "DIGIT", "SPACE",
+               "END", "PAUSE", "QUOTE", "BRACKET", "OTHER"]
+
+
+class SetFragments:
     """
-    Fragment transforms candidate features into differently sized spaces.
-    The transforms are intentionally not inverses of one another.
+    Three set-valued lifts of (context, candidate), each living in a different
+    space and none invertible into the others:
+      g1  Follow sets            subsets of the alphabet (|U| bits)
+      g2  class signatures       bit-vectors over symbol classes (11 bits)
+      g3  recent-symbol window   subset of U built from the last w symbols
     """
 
-    def __init__(self, seed: int = 17):
-        rng = np.random.default_rng(seed)
-        self.w_context = rng.normal(0, 0.7, size=(5, 3))
-        self.w_word = rng.normal(0, 0.7, size=(5, 4))
-        self.w_transition = rng.normal(0, 0.7, size=(5, 2))
+    def __init__(self, space: SymbolSpace, named: Dict[str, SymbolSet],
+                 model: NGramModel, window: int = 8, min_follow: int = 2):
+        self.space, self.named, self.window = space, named, window
+        self.empty = space.empty()
 
-    @staticmethod
-    def _unit(v: np.ndarray) -> np.ndarray:
-        n = float(np.linalg.norm(v))
-        return v / n if n > 1e-12 else np.zeros_like(v)
+        # g1: Follow(s) = union of {t} for every t that followed s often enough
+        self.follow: Dict[str, SymbolSet] = {}
+        for s, counter in model.bigrams.items():
+            strong = [t for t, c in counter.items() if c >= min_follow]
+            chosen = strong if strong else list(counter)
+            self.follow[s] = space.chars(chosen)
 
-    @staticmethod
-    def _hash_features(token: str, width: int) -> np.ndarray:
-        """Stable token features; does not depend on Python's randomized hash."""
-        raw = token.lower().encode("utf-8", errors="ignore")
-        vals = np.zeros(width, dtype=float)
-        if not raw:
-            return vals
-        for i, byte in enumerate(raw):
-            vals[i % width] += ((byte % 31) - 15) / 15.0
-            vals[(i * 3 + 1) % width] += ((byte % 17) - 8) / 8.0
-        vals /= max(1, len(raw))
-        vals[0] += min(len(raw), 20) / 20.0
-        vals[1] += sum(chr(b).isalpha() for b in raw) / max(1, len(raw))
-        return np.tanh(vals)
+        # g2: class signature of each symbol as an int bit-vector
+        self.signature: Dict[str, int] = {}
+        for sym in space.symbols:
+            bits = 0
+            for k, name in enumerate(CLASS_ORDER):
+                if sym in named[name]:
+                    bits |= 1 << k
+            self.signature[sym] = bits
 
-    def features(self, context: Sequence[str], token: str, logp: float, rank: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        recent = list(context[-4:])
-        ctx_vec = np.zeros(5, dtype=float)
-        if recent:
-            for i, word in enumerate(recent):
-                f = self._hash_features(word, 5)
-                ctx_vec += f * (0.65 ** (len(recent) - i - 1))
-            ctx_vec /= max(1, len(recent))
-        word_vec = self._hash_features(token, 5)
-        transition_vec = np.array([
-            np.tanh(logp),
-            1.0 / (1.0 + rank),
-            1.0 if token[:1].isupper() else 0.0,
-            1.0 if token in ".,!?;:" else 0.0,
-            min(len(token), 24) / 24.0
-        ], dtype=float)
-        # Distinct output dimensions: R^3, R^4, and R^2.
-        g1 = np.tanh(ctx_vec @ self.w_context)
-        g2 = np.tanh(word_vec @ self.w_word)
-        g3 = np.tanh(transition_vec @ self.w_transition)
-        return g1, g2, g3
+    def _follow(self, sym: str) -> SymbolSet:
+        return self.follow.get(sym, self.empty)
 
-    def score(self, context: Sequence[str], token: str, logp: float, rank: int, lam: float) -> Tuple[float, float]:
-        g1, g2, g3 = self.features(context, token, logp, rank)
-        # Project each distinct fragment to a scalar summary, not an isomorphism.
-        summaries = np.array([
-            np.linalg.norm(g1),
-            np.linalg.norm(g2),
-            np.linalg.norm(g3)
-        ])
-        mean = float(np.mean(summaries))
-        spread = float(np.std(summaries) / (mean + 1e-9))
-        consistency = float(np.clip(0.55 * spread + 0.45 * (1.0 - np.mean(summaries)), 0.0, 1.0))
+    def _sig(self, sym: str) -> int:
+        return self.signature.get(sym, 0)
 
-        # Alignment is cosine similarity between padded/truncated local summaries
-        # and a context-conditioned reference vector.
-        ref = self._unit(np.array([
-            np.mean(g1),
-            np.mean(g2),
-            np.mean(g3),
-            np.tanh(logp),
-        ]))
-        candidate = self._unit(np.array([
-            g1[0],
-            g2[0],
-            g3[0],
-            np.tanh(logp + 0.1 * rank)
-        ]))
-        cosine = float(np.dot(ref, candidate))
-        alignment = (cosine + 1.0) / 2.0
+    def measures(self, context: Sequence[str], token: str) -> Tuple[float, float]:
+        """Return (consistency D, alignment), both in [0, 1], via set operations."""
+        last = context[-1] if context else BOS
+        f_last, f_cand = self._follow(last), self._follow(token)
+        union = f_last | f_cand
 
-        # As lambda rises, the model moves from exploratory scoring to
-        # stronger language-model and fragment alignment influence.
+        # g1 fragments: membership (AND), symmetric difference (XOR) over union (OR)
+        if f_last:
+            m_member = 0.0 if token in f_last else 1.0
+        else:
+            m_member = 0.5
+        m_xor = len(f_last ^ f_cand) / len(union) if union else 0.5
+        jaccard = len(f_last & f_cand) / len(union) if union else 0.5
+
+        # g2 fragment: class-signature Hamming distance (XOR on bit-vectors)
+        m_class = bin(self._sig(last) ^ self._sig(token)).count("1") / len(CLASS_ORDER)
+
+        # g3 fragment: how much of the candidate's follow set lies in the recent window
+        win = self.space.chars(context[-self.window:])
+        overlap = len(f_cand & win) / max(1, len(win))
+
+        consistency = float(np.clip(0.25 * m_member + 0.45 * m_xor + 0.30 * m_class, 0.0, 1.0))
+        alignment = float(np.clip(0.6 * jaccard + 0.4 * overlap, 0.0, 1.0))
+        return consistency, alignment
+
+    def score(self, context: Sequence[str], token: str, logp: float,
+              lam: float) -> Tuple[float, float, float]:
+        consistency, alignment = self.measures(context, token)
         fragment_score = 1.6 * alignment - 1.15 * consistency
-        total_score = (1.0 - lam) * (0.75 * logp + 0.25 * fragment_score) + lam * (1.25 * logp + 0.85 * fragment_score)
-        return total_score, consistency
+        total = ((1.0 - lam) * (0.75 * logp + 0.25 * fragment_score)
+                 + lam * (1.25 * logp + 0.85 * fragment_score))
+        return total, consistency, alignment
+
+
+# --------------------------------------------------------------------------
+# Generation
+# --------------------------------------------------------------------------
 
 def adiabatic_lambda(step: int, total_steps: int) -> float:
     u = min(1.0, max(0.0, step / max(1, total_steps - 1)))
     return 3.0 * u * u - 2.0 * u * u * u
+
 
 def softmax(values: Sequence[float], temperature: float = 1.0) -> np.ndarray:
     temp = max(1e-6, float(temperature))
@@ -215,100 +317,129 @@ def softmax(values: Sequence[float], temperature: float = 1.0) -> np.ndarray:
     exp = np.exp(np.clip(arr, -60, 60))
     return exp / max(float(exp.sum()), 1e-12)
 
+
 def generate(
     model: NGramModel,
+    fragments: SetFragments,
     prompt: str,
-    token_count: int = 800,
+    token_count: int = 400,
     beam_size: int = 8,
-    tau: float = 0.65,
+    tau: float = 0.8,
     temperature: float = 0.85,
     seed: int = 7,
+    allowed: SymbolSet = None,
     show_trace: bool = False,
 ) -> str:
     rng = random.Random(seed)
-    fragments = NonIsomorphicFragments(seed)
-    output = tokenize(prompt)
-    if not output:
-        output = ["The"]
-    original_prompt_len = len(output)
+    output = tokenize(prompt) or ["T"]
+    n_symbols = len(fragments.space.symbols)
 
     for step in range(max(0, token_count)):
         lam = adiabatic_lambda(step, max(1, token_count))
-        ranked = model.candidates(output, limit=max(40, beam_size * 8))
-        scored: List[Candidate] = []
+        ranked = [(t, lp) for t, lp in model.candidates(output, limit=max(n_symbols + 2, 40))
+                  if t not in (BOS, EOS)]
+        if allowed is not None:
+            gated = [(t, lp) for t, lp in ranked if t in allowed]
+            ranked = gated or ranked  # never dead-end on the gate
+ 
 
-        for rank, (token, logp) in enumerate(ranked):
-            score, consistency = fragments.score(output, token, logp, rank, lam)
-            # Alignment proxy retained for traceability.
-            alignment = float(np.clip((score - logp) / 2.5 + 0.5, 0.0, 1.0))
+        scored: List[Candidate] = []
+        for token, logp in ranked:
+            score, consistency, alignment = fragments.score(output, token, logp, lam)
             if consistency <= tau:
                 scored.append(Candidate(token, logp, score, consistency, alignment))
 
-        # Avoid a dead end if all candidates fail the constraint.
-        if not scored:
+        if not scored:  # fallback: best raw candidate
             token, logp = ranked[0]
-            score, consistency = fragments.score(output, token, logp, 0, lam)
-            scored = [Candidate(token, logp, score, consistency, 0.5)]
+            score, consistency, alignment = fragments.score(output, token, logp, lam)
+            scored = [Candidate(token, logp, score, consistency, alignment)]
 
         scored.sort(key=lambda c: c.score, reverse=True)
         beam = scored[:max(1, beam_size)]
         probs = softmax([c.score for c in beam], temperature)
-        for candidate, prob in zip(beam, probs):
-            candidate.probability = float(prob)
+        for cand, p in zip(beam, probs):
+            cand.probability = float(p)
 
         chosen = beam[0] if temperature <= 0.01 else rng.choices(beam, weights=probs, k=1)[0]
         output.append(chosen.token)
 
-    # Remove internal end marker and preserve the prompt as part of the result.
+        if show_trace:
+            print(f"[{step:4d}] lam={lam:.2f} {chosen.token!r:>6} "
+                  f"logp={chosen.base_logp:7.3f} D={chosen.consistency:.3f} "
+                  f"align={chosen.alignment:.3f} p={chosen.probability:.3f}")
 
-    text = ' '.join(output)
+    return detokenize(output)
 
-    return text
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="N-gram text generator with non-isomorphic adiabatic fragment scoring.")
-    parser.add_argument("corpus", nargs="?", help="UTF-8 text corpus file; uses a small built-in corpus if omitted.")
-    parser.add_argument("--prompt", default="A process", help="Initial text context.")
-    parser.add_argument("--tokens", type=int, default=800, help="Maximum number of new tokens.")
-    parser.add_argument("--order", type=int, default=3, help="N-gram order (default: 3).")
-    parser.add_argument("--alpha", type=float, default=0.25, help="Additive smoothing value.")
-    parser.add_argument("--beam", type=int, default=8, help="Number of candidate next words retained before sampling.")
-    parser.add_argument("--tau", type=float, default=0.65, help="Maximum allowed fragment consistency score (0..1).")
-    parser.add_argument("--temperature", type=float, default=0.85, help="Sampling temperature; near zero selects the top candidate.")
-    parser.add_argument("--seed", type=int, default=7, help="Random seed for repeatable generation.")
-    parser.add_argument("--trace", action="store_true", help="Print per-token scoring diagnostics.")
-    parser.add_argument("--save", help="Optional output text file.")
-    args = parser.parse_args()
+    ap = argparse.ArgumentParser(description="Character-level generator with symbol-set adiabatic scoring.")
+    ap.add_argument("corpus", nargs="?", help="UTF-8 text file; built-in corpus if omitted.")
+    ap.add_argument("--prompt", default="Once upon a", help="Initial text context.")
+    ap.add_argument("--tokens", type=int, default=4000, help="Number of new symbols.")
+    ap.add_argument("--order", type=int, default=5, help="Symbol n-gram order (default 5).")
+    ap.add_argument("--alpha", type=float, default=0.25, help="Additive smoothing.")
+    ap.add_argument("--beam", type=int, default=8, help="Candidates kept before sampling.")
+    ap.add_argument("--tau", type=float, default=0.8, help="Max consistency score D (0..1).")
+    ap.add_argument("--temperature", type=float, default=0.85, help="Sampling temperature.")
+    ap.add_argument("--window", type=int, default=8, help="Recent-symbol window size for g3.")
+    ap.add_argument("--seed", type=int, default=7, help="Random seed.")
+    ap.add_argument("--allow", help="Set expression: only these symbols may be emitted.")
+    ap.add_argument("--forbid", help="Set expression: these symbols are removed.")
+    ap.add_argument("--sets", action="store_true", help="Print the named symbol sets and exit.")
+    ap.add_argument("--interactive", action="store_true", help="Prompt repeatedly.")
+    ap.add_argument("--trace", action="store_true", help="Per-symbol diagnostics.")
+    ap.add_argument("--save", help="Write the last output to this file.")
+    args = ap.parse_args()
 
     if args.corpus:
-        corpus_path = Path(args.corpus)
-        if not corpus_path.is_file():
-            parser.error(f"Corpus file not found: {corpus_path}")
+        path = Path(args.corpus)
+        if not path.is_file():
+            ap.error(f"Corpus file not found: {path}")
         try:
-            corpus_text = corpus_path.read_text(encoding="utf-8-sig")
+            corpus = path.read_text(encoding="utf-8-sig")
         except UnicodeDecodeError as exc:
-            parser.error(f"Could not decode corpus as UTF-8: {exc}")
+            ap.error(f"Could not decode corpus as UTF-8: {exc}")
     else:
-        corpus_text = BUILTIN_CORPUS
+        corpus = BUILTIN_CORPUS
+    if not corpus:
+        ap.error("Corpus is empty.")
 
-    if not tokenize(corpus_text):
-        parser.error("Corpus contains no recognizable tokens.")
     model = NGramModel(order=args.order, alpha=args.alpha)
-    model.train(corpus_text)
-    while True:
-        result = generate(
-            model=model,
-            prompt=input("USER: "),
-            token_count=args.tokens,
-            beam_size=args.beam,
-            tau=float(np.clip(args.tau, 0.0, 1.0)),
-            temperature=max(0.0, args.temperature),
-            seed=args.seed,
-            show_trace=args.trace,
-        )
+    model.train(corpus)
 
-        print("\n--- GENERATED TEXT ---\n")
-        print(result)
+    space = SymbolSpace(s for s in model.vocab if s not in (BOS, EOS))
+    named = build_named_sets(space)
+
+    if args.sets:
+        for name, s in named.items():
+            print(f"{name:10s} |{len(s):3d}|  {s!r}")
+        return
+
+    allowed = None
+    if args.allow:
+        allowed = eval_set_expr(args.allow, space, named)
+    if args.forbid:
+        banned = eval_set_expr(args.forbid, space, named)
+        allowed = (allowed if allowed is not None else space.universe()) - banned
+
+    fragments = SetFragments(space, named, model, window=args.window)
+    tau = float(np.clip(args.tau, 0.0, 1.0))
+    temperature = max(0.0, args.temperature)
+
+    def run(prompt: str) -> str:
+        return generate(model, fragments, prompt, args.tokens, args.beam, tau,
+                        temperature, args.seed, allowed, args.trace)
+
+    result = ""
+
+    try:
+        while True:
+            prompt = input("USER: ")
+            result = run(prompt)
+            print("\n--- GENERATED TEXT ---\n")
+            print(result, "\n")
+    except (EOFError, KeyboardInterrupt):
+        print()
 
 if __name__ == "__main__":
     main()
