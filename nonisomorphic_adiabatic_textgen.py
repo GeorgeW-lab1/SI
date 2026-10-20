@@ -325,7 +325,7 @@ def main() -> None:
     parser.add_argument("--alpha", type=float, default=0.25, help="Additive smoothing value.")
     parser.add_argument("--beam", type=int, default=18, help="Number of candidate next words retained before sampling.")
     parser.add_argument("--tau", type=float, default=0.65, help="Maximum allowed fragment consistency score (0..1).")
-    parser.add_argument("--temperature", type=float, default=0.85, help="Sampling temperature; near zero selects the top candidate.")
+    parser.add_argument("--temperature", type=float, default=1.85, help="Sampling temperature; near zero selects the top candidate.")
     parser.add_argument("--seed", type=int, default=7, help="Random seed for repeatable generation.")
     parser.add_argument("--trace", action="store_true", help="Print per-token scoring diagnostics.")
     parser.add_argument("--save", help="Optional output text file.")
