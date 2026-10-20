@@ -99,7 +99,7 @@ def prepare_corpus_with_causal_ascent(corpus_text: str, alpha_mix: float = 0.3) 
         for token in set(tokens):
             p_local = local_counter[token] / total_local
             p_global = global_counter[token] / total_global
-            mixed_weights[token] = (1.0 - alpha_mix) * p_local + alpha_mix * p_global
+            mixed_weights[token] = (1.0 - alpha_mix) * p_local * alpha_mix * p_global
 
         # Purporting causal ascent: calculate information entropy as a directional gradient metric
         entropy = -sum(p * math.log(max(p, 1e-12)) for p in mixed_weights.values())
@@ -323,7 +323,7 @@ def main() -> None:
     parser.add_argument("--tokens", type=int, default=800, help="Maximum number of new tokens.")
     parser.add_argument("--order", type=int, default=3, help="N-gram order (default: 3).")
     parser.add_argument("--alpha", type=float, default=0.25, help="Additive smoothing value.")
-    parser.add_argument("--beam", type=int, default=8, help="Number of candidate next words retained before sampling.")
+    parser.add_argument("--beam", type=int, default=18, help="Number of candidate next words retained before sampling.")
     parser.add_argument("--tau", type=float, default=0.65, help="Maximum allowed fragment consistency score (0..1).")
     parser.add_argument("--temperature", type=float, default=0.85, help="Sampling temperature; near zero selects the top candidate.")
     parser.add_argument("--seed", type=int, default=7, help="Random seed for repeatable generation.")
