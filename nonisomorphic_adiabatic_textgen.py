@@ -321,7 +321,7 @@ def main() -> None:
     parser.add_argument("corpus", nargs="?", help="UTF-8 text corpus file; uses a small built-in corpus if omitted.")
     parser.add_argument("--prompt", default="A process", help="Initial text context.")
     parser.add_argument("--tokens", type=int, default=800, help="Maximum number of new tokens.")
-    parser.add_argument("--order", type=int, default=3, help="N-gram order (default: 3).")
+    parser.add_argument("--order", type=int, default=4, help="N-gram order (default: 3).")
     parser.add_argument("--alpha", type=float, default=0.25, help="Additive smoothing value.")
     parser.add_argument("--beam", type=int, default=18, help="Number of candidate next words retained before sampling.")
     parser.add_argument("--tau", type=float, default=0.95, help="Maximum allowed fragment consistency score (0..1).")
