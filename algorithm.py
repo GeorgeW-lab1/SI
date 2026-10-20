@@ -181,7 +181,7 @@ class NonIsomorphicFragments:
     """
 
     def __init__(self, seed: int = 17):
-        rng = np.random.default_rng(seed)
+        rng = np.random.default_rng()#edited
         self.w_context = rng.normal(0, 0.7, size=(5, 3))
         self.w_word = rng.normal(0, 0.7, size=(5, 4))
         self.w_transition = rng.normal(0, 0.7, size=(5, 2))
