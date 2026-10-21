@@ -16,7 +16,7 @@ def load_text():
 
 
 class CoordModel:
-    def __init__(self, text, order=4, spread=15.0):
+    def __init__(self, text, order=4, spread=115.0):
         self.order, self.spread = order, spread
         self.freq = Counter(text)
         self.chars = sorted(self.freq)                                 # position axis
@@ -71,8 +71,8 @@ HELP = """Type a prompt and press Enter to generate a continuation.
 
 def main():
     text = load_text()
-    model = CoordModel(text, order=6)
-    length, temp = 400, 0.8
+    model = CoordModel(text, order=8)
+    length, temp = 1400, 0.8
     print(f"{len(text):,} chars, {len(model.chars)} unique")
     for ch in "mM e\n":
         if ch in model.coords:
