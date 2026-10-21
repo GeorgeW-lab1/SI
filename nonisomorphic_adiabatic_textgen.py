@@ -549,7 +549,7 @@ def main() -> None:
 
     result = generate(
         model=model,
-        prompt=args.prompt,
+        prompt=input("USER: "),
         token_count=args.tokens,
         beam_size=args.beam,
         tau=float(np.clip(args.tau, 0.0, 1.0)),
