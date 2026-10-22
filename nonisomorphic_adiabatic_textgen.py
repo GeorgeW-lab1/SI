@@ -92,7 +92,7 @@ def _content(tok: str) -> bool:
 # out of old ones without ever touching the source text again.
 # ---------------------------------------------------------------------------
 
-MARKOV_ORDER = 1          # order-1 chains share contexts, so fragments can recombine
+MARKOV_ORDER = 3          # order-1 chains share contexts, so fragments can recombine
 
 
 def _norm(d: Optional[Dict[str, float]]) -> Dict[str, float]:
@@ -487,24 +487,51 @@ class SortedSentenceList:
             cur.next = node
         self.size += 1
 
+    def extend_sorted(self, nodes: Sequence[SentenceNode]) -> None:
+        """Bulk build: sort once, link with a tail pointer (O(n log n) instead of
+        O(n^2) repeated insert()). Result is the same sorted linked list."""
+        tail = None
+        for node in sorted(nodes, key=lambda n: n.score):    # stable: ties keep corpus order
+            node.next = None
+            if tail is None:
+                self.head = node
+            else:
+                tail.next = node
+            tail = node
+            self.size += 1
+
     def __iter__(self) -> Iterator[SentenceNode]:
         cur = self.head
         while cur is not None:
             yield cur
             cur = cur.next
 
-    def link_instructions(self, order: Optional[Sequence[Module]] = None) -> None:
-        """Attach a module to each node according to its rank."""
+    def link_instructions(self, order: Optional[Sequence[Module]] = None,
+                          assign: str = "cycle") -> None:
+        """Attach a module to every node.
+
+        cycle  (default): rank % len(order) -> consecutive nodes run OBSERVE,
+                          DESCRIBE, RELATE, ... so every module appears within the
+                          first len(order) nodes, however large the corpus is, and
+                          each module's upstream result is the node just before it.
+        blocks:           old behaviour, one contiguous block of nodes per module.
+                          On a large corpus the token budget is spent inside the
+                          first block, so later modules never run.
+        """
         order = list(order) if order else INSTRUCTIONS
         for rank, node in enumerate(self):
-            idx = min(len(order) - 1, rank * len(order) // max(1, self.size))
+            if assign == "blocks":
+                idx = min(len(order) - 1, rank * len(order) // max(1, self.size))
+            else:
+                idx = rank % len(order)
             node.instruction = order[idx]
             node.markov.name = f"node{rank}"
             node.markov.sources = [node.markov.name]
 
 
 def build_sentence_list(corpus_text: str, alpha_mix: float = 0.3,
-                        order: Optional[Sequence[Module]] = None) -> SortedSentenceList:
+                        order: Optional[Sequence[Module]] = None,
+                        assign: str = "cycle") -> SortedSentenceList:
     """
     Split corpus into sentences, mix local/global token frequencies, score each
     sentence as log(sum(exp(surprisal))), insert into a sorted linked list, and
@@ -520,6 +547,7 @@ def build_sentence_list(corpus_text: str, alpha_mix: float = 0.3,
     total_global = max(1, sum(global_counter.values()))
 
     sl = SortedSentenceList()
+    nodes: List[SentenceNode] = []
     for text, toks in zip(sentences, token_lists):
         if not toks:
             continue
@@ -531,9 +559,10 @@ def build_sentence_list(corpus_text: str, alpha_mix: float = 0.3,
             p_global = global_counter[tok] / total_global
             p_mix = (1.0 - alpha_mix) * p_local + alpha_mix * p_global
             surprisals.append(-math.log(max(p_mix, 1e-12)))
-        sl.insert(SentenceNode(text, toks, logsumexp(surprisals)))
+        nodes.append(SentenceNode(text, toks, logsumexp(surprisals)))
 
-    sl.link_instructions(order)
+    sl.extend_sorted(nodes)
+    sl.link_instructions(order, assign)
     return sl
 
 
@@ -922,7 +951,7 @@ def main() -> None:
     parser.add_argument("corpus", nargs="?", help="UTF-8 text corpus file; uses a small built-in corpus if omitted.")
     parser.add_argument("--prompt", default="A process", help="Initial text context.")
     parser.add_argument("--tokens", type=int, default=1800, help="Maximum number of new tokens.")
-    parser.add_argument("--order", type=int, default=3, help="N-gram order (default: 3).")
+    parser.add_argument("--order", type=int, default=2, help="N-gram order (default: 3).")
     parser.add_argument("--alpha", type=float, default=0.25, help="Additive smoothing value.")
     parser.add_argument("--beam", type=int, default=18, help="Number of candidate next words retained before sampling.")
     parser.add_argument("--tau", type=float, default=0.95, help="Maximum allowed fragment consistency score (0..1).")
@@ -936,6 +965,9 @@ def main() -> None:
                         help="Prefix each line with the module that produced it, e.g. [OBSERVE].")
     parser.add_argument("--modules", default=",".join(m.name for m in INSTRUCTIONS),
                         help="Comma-separated module order, e.g. OBSERVE,DESCRIBE,RELATE.")
+    parser.add_argument("--assign", choices=["cycle", "blocks"], default="cycle",
+                        help="How modules are spread over the sorted list: cycle (every module "
+                             "appears, default) or blocks (one contiguous block per module).")
     parser.add_argument("--results-json", help="Write every ModuleResult and its markovlet to this JSON file.")
     args = parser.parse_args()
 
@@ -959,7 +991,7 @@ def main() -> None:
         print(f"[warn] {warning} (module will run without it)")
 
     # Sorted linked list of sentences, each linked to a module
-    sentence_list = build_sentence_list(corpus_text, alpha_mix=0.3, order=order)
+    sentence_list = build_sentence_list(corpus_text, alpha_mix=0.3, order=order, assign=args.assign)
     corpus_text = flatten_sentence_list(sentence_list)
     if args.trace:
         print("--- SORTED SENTENCE LIST ---")
@@ -991,6 +1023,13 @@ def main() -> None:
 
     print("\n--- GENERATED TEXT ---\n")
     print(result)
+
+    coverage = Counter(r.module for r in exec_log)
+    print("\n--- MODULE COVERAGE ---")
+    print("  ".join(f"{m.name}x{coverage.get(m.name, 0)}" for m in order))
+    idle = [m.name for m in order if coverage.get(m.name, 0) == 0]
+    if idle:
+        print(f"[note] never ran: {', '.join(idle)} (raise --tokens, or use --assign cycle)")
 
     if args.trace:
         print("\n--- MARKOVLETS BUILT ---")
