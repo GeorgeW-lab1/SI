@@ -78,6 +78,172 @@ END = {".", "!", "?"}
 SPECIAL = {"<bos>", "<eos>"}
 
 
+# ---------------------------------------------------------------------------
+# Dataset phrase modules: automatically learn phrases following "is/are/was/were"
+# and substitute them into generated continuations.
+# ---------------------------------------------------------------------------
+
+DATASET_BE_RE = re.compile(r"\b(is|are|was|were)\b(?:\s+|$)", re.IGNORECASE)
+DATASET_SENTENCE_RE = re.compile(r"(?<=[.!?])\s+|\n+")
+DATASET_WORD_RE = re.compile(r"[A-Za-z][A-Za-z'-]*")
+DATASET_STOPWORDS = {
+    "a", "an", "the", "of", "in", "on", "at", "to", "for", "by", "with",
+    "from", "as", "and", "or", "but", "that", "this", "these", "those",
+    "it", "its", "they", "their", "he", "she", "we", "you", "i", "be",
+    "been", "being", "has", "have", "had", "do", "does", "did", "not", "no",
+    "can", "could", "may", "might", "will", "would", "shall", "should", "must",
+    "than", "then", "also", "often", "very", "which", "who", "what", "when",
+}
+
+
+def extract_dataset_modules(corpus_text: str, max_words: int = 12) -> list:
+    """Extract frequent short definition phrases following forms of 'to be'."""
+    counts = Counter()
+    for sentence in DATASET_SENTENCE_RE.split(corpus_text):
+        sentence = re.sub(r"\s+", " ", sentence).strip()
+        if not sentence or sentence.startswith("###"):
+            continue
+        match = DATASET_BE_RE.search(sentence)
+        if not match:
+            continue
+        tail = re.split(r"[.!?;]", sentence[match.end():], maxsplit=1)[0]
+        tail = re.sub(r"\([^)]*\)", " ", tail).strip(" ,:;—–-\t")
+        tail = re.sub(r"^(?:(?:a|an|the)\s+)+", "", tail, flags=re.IGNORECASE)
+        words = DATASET_WORD_RE.findall(tail)[:max_words]
+        if not words or not any(w.lower() not in DATASET_STOPWORDS for w in words):
+            continue
+        phrase = " ".join(words).lower().strip()
+        if len(phrase) >= 3:
+            counts[phrase] += 1
+    return [
+        {"phrase": phrase, "frequency": count,
+         "words": [w.lower() for w in DATASET_WORD_RE.findall(phrase)]}
+        for phrase, count in counts.most_common()
+    ]
+
+
+def load_dataset_modules(corpus_text: str, modules_path: str = "modules.json") -> list:
+    """Load modules.json, or build it automatically from the supplied corpus."""
+    path = Path(modules_path)
+    if path.is_file():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            modules = data.get("modules", []) if isinstance(data, dict) else data
+            modules = [m for m in modules if isinstance(m, dict) and m.get("phrase")]
+            if modules:
+                return modules
+        except (OSError, json.JSONDecodeError, AttributeError):
+            print(f"[warn] Could not read {path}; rebuilding dataset modules.")
+
+    modules = extract_dataset_modules(corpus_text)
+    if modules:
+        data = {
+            "module_count": len(modules),
+            "modules": modules,
+            "source": "automatically extracted from corpus",
+        }
+        try:
+            path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            print(f"[dataset modules] Extracted {len(modules)} phrases -> {path}")
+        except OSError as exc:
+            print(f"[warn] Could not save {path}: {exc}")
+    return modules
+
+
+def choose_dataset_phrase(subject: str, prompt: str, modules: list, used: Counter) -> str:
+    """Choose a relevant dataset phrase using context overlap and frequency."""
+    if not modules:
+        return ""
+    context_words = {
+        w.lower() for w in DATASET_WORD_RE.findall(subject + " " + prompt)
+        if w.lower() not in DATASET_STOPWORDS
+    }
+    ranked = []
+    for module in modules:
+        phrase = str(module.get("phrase", "")).strip()
+        if not phrase:
+            continue
+        words = set(str(w).lower() for w in module.get("words", DATASET_WORD_RE.findall(phrase)))
+        words -= DATASET_STOPWORDS
+        overlap = len(context_words & words)
+        # Light prefix matching helps concepts such as algebra/algebraic match.
+        fuzzy_overlap = sum(
+            1 for context_word in context_words
+            if context_word not in words and any(
+                len(context_word) >= 5 and len(word) >= 5 and
+                (context_word.startswith(word[:5]) or word.startswith(context_word[:5]))
+                for word in words
+            )
+        )
+        frequency = max(1, int(module.get("frequency", 1)))
+        # Prefer contextual matches, common dataset phrases, and less-repeated phrases.
+        score = ((overlap + 0.7 * fuzzy_overlap) * 3.0) + min(1.0, frequency / 20.0) - (used[phrase.lower()] * 0.8)
+        ranked.append((score, frequency, phrase))
+    if not ranked:
+        return ""
+    ranked.sort(reverse=True)
+    best_score = ranked[0][0]
+    shortlist = [item for item in ranked if item[0] >= best_score - 0.25][:8]
+    # Deterministic tie-breaking: choose the least-used/highest-frequency candidate.
+    shortlist.sort(key=lambda item: (used[item[2].lower()], -item[1], item[2]))
+    phrase = shortlist[0][2]
+    used[phrase.lower()] += 1
+    return phrase
+
+
+def substitute_dataset_modules(text: str, prompt: str, modules: list) -> str:
+    """Replace generated text after is/are/was/were with learned dataset phrases."""
+    if not text or not modules:
+        return text
+    used = Counter()
+    lines = text.splitlines()
+    if len(lines) > 1:
+        # Rewrite the prompt too: a prompt ending in "is" is a definition slot.
+        rewritten = [_substitute_line(lines[0], prompt, modules, used)]
+        for line in lines[1:]:
+            if line.strip().startswith("==") or not line.strip():
+                rewritten.append(line)
+                continue
+            rewritten.append(_substitute_line(line, prompt, modules, used))
+        return "\n".join(rewritten)
+
+    # Inline output: if the prompt itself contains a definition slot, rewrite it;
+    # otherwise preserve the exact prompt prefix and process only the continuation.
+    if text.startswith(prompt):
+        if DATASET_BE_RE.search(prompt):
+            rewritten_prompt = _substitute_line(prompt, prompt, modules, used)
+            remainder = text[len(prompt):]
+            return rewritten_prompt + _substitute_line(remainder, prompt, modules, used)
+        prefix = prompt
+        remainder = text[len(prompt):]
+        return prefix + _substitute_line(remainder, prompt, modules, used)
+    return _substitute_line(text, prompt, modules, used)
+
+
+def _substitute_line(line: str, prompt: str, modules: list, used: Counter) -> str:
+    matches = list(DATASET_BE_RE.finditer(line))
+    if not matches:
+        return line
+    # Replace the phrase after the final copula in the line, avoiding repeated
+    # rewrites of earlier clauses and preserving any final punctuation.
+    match = matches[-1]
+    tail_start = match.end()
+    tail = line[tail_start:]
+    punctuation_match = re.search(r"[.!?](?:[\"'’)]*)\s*$", tail)
+    punctuation = ""
+    if punctuation_match:
+        punctuation = punctuation_match.group(0)
+        tail = tail[:punctuation_match.start()]
+    subject = line[:match.start()].strip()
+    phrase = choose_dataset_phrase(subject, prompt, modules, used)
+    if not phrase:
+        return line
+    prefix = line[:tail_start]
+    if prefix and not prefix[-1].isspace():
+        prefix += " "
+    return prefix + phrase + punctuation
+
+
 def _content(tok: str) -> bool:
     return len(tok) > 3 and tok not in PUNCT
 
@@ -975,6 +1141,8 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=7, help="Random seed for repeatable generation.")
     parser.add_argument("--trace", action="store_true", help="Print per-token scoring diagnostics.")
     parser.add_argument("--save", help="Optional output text file.")
+    parser.add_argument("--dataset-modules", default="modules.json", help="JSON file of learned phrases; created from the corpus if missing.")
+    parser.add_argument("--no-dataset-substitution", action="store_true", help="Disable automatic replacement after is/are/was/were.")
     parser.add_argument("--inline", action="store_true",
                         help="Join all module segments into one paragraph instead of one line each.")
     parser.add_argument("--labels", action="store_true",
@@ -1000,6 +1168,10 @@ def main() -> None:
             parser.error(f"Could not decode corpus as UTF-8: {exc}")
     else:
         corpus_text = BUILTIN_CORPUS
+
+    dataset_modules = [] if args.no_dataset_substitution else load_dataset_modules(corpus_text, args.dataset_modules)
+    if dataset_modules:
+        print(f"[dataset modules] {len(dataset_modules)} phrases available for automatic substitution")
 
     names = [n.strip().upper() for n in args.modules.split(",") if n.strip()]
     unknown = [n for n in names if n not in MODULES]
@@ -1040,6 +1212,9 @@ def main() -> None:
         labels=args.labels,
         arrange=args.arrange,
     )
+
+    if not args.no_dataset_substitution and dataset_modules:
+        result = substitute_dataset_modules(result, args.prompt, dataset_modules)
 
     print("\n--- GENERATED TEXT ---\n")
     print(result)
