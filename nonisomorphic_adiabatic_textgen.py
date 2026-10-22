@@ -902,13 +902,15 @@ def generate(
     results: Optional[List[ModuleResult]] = None,
     layout: str = "lines",
     labels: bool = False,
+    arrange: str = "grouped",
 ) -> str:
     """Pipeline: walk the linked list, run each node's module, publish the
     resulting markovlet to a blackboard that later modules compose from."""
     rng = random.Random(seed)
     fragments = NonIsomorphicFragments(seed)
     output = tokenize(prompt) or ["The"]
-    lines: List[str] = [detokenize(output)]          # line 0 = the prompt
+    prompt_line = detokenize(output)
+    entries: List[Tuple[str, str]] = []              # (module name, line) in run order
     all_vocab = frozenset(set(model.vocab) - SPECIAL)
     results = results if results is not None else []
     blackboard: Dict[str, ModuleResult] = {}
@@ -933,7 +935,7 @@ def generate(
         res.markovlet.sources = [res.markovlet.name]
 
         output.extend(res.tokens)
-        lines.append(f"[{res.module}] {res.text}" if labels else res.text)   # one module = one line
+        entries.append((res.module, f"[{res.module}] {res.text}" if labels else res.text))
         blackboard[res.provides] = res
         results.append(res)
         produced += len(res.tokens)
@@ -943,7 +945,21 @@ def generate(
         else:
             node, node_idx = node.next, node_idx + 1
 
-    return "\n".join(lines) if layout == "lines" else detokenize(output)
+    if layout != "lines":
+        return detokenize(output)
+    if arrange == "sequence":                        # chronological: one line per module run
+        return "\n".join([prompt_line] + [line for _, line in entries])
+
+    # grouped: every module's lines together, groups in module order
+    groups: Dict[str, List[str]] = {}
+    for name, line in entries:                       # dict keeps first-appearance (= module) order
+        groups.setdefault(name, []).append(line)
+    out = [prompt_line]
+    for name, group_lines in groups.items():
+        out.append("")
+        out.append(f"== {name} x{len(group_lines)} ==")
+        out.extend(group_lines)
+    return "\n".join(out)
 
 
 def main() -> None:
@@ -965,6 +981,9 @@ def main() -> None:
                         help="Prefix each line with the module that produced it, e.g. [OBSERVE].")
     parser.add_argument("--modules", default=",".join(m.name for m in INSTRUCTIONS),
                         help="Comma-separated module order, e.g. OBSERVE,DESCRIBE,RELATE.")
+    parser.add_argument("--arrange", choices=["grouped", "sequence"], default="grouped",
+                        help="grouped (default): all OBSERVE lines, then all DESCRIBE lines, ... in module "
+                             "order; sequence: lines in the order the modules actually ran.")
     parser.add_argument("--assign", choices=["cycle", "blocks"], default="cycle",
                         help="How modules are spread over the sorted list: cycle (every module "
                              "appears, default) or blocks (one contiguous block per module).")
@@ -1019,6 +1038,7 @@ def main() -> None:
         results=exec_log,
         layout="inline" if args.inline else "lines",
         labels=args.labels,
+        arrange=args.arrange,
     )
 
     print("\n--- GENERATED TEXT ---\n")
