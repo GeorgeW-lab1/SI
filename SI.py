@@ -1,1249 +1,882 @@
+#!/usr/bin/env python3
+"""Variable-cell IR arithmetic bench and 20 x 20 mm printable mask.
+Install: python -m pip install pillow
+Run: python reusable_ir_bench.py
+Cells can be changed in the GUI (1..64); DEFAULT_CELLS sets the startup value.
+Modes: full-adder test, optical X+Y, trial-division factoring, and
+subset-sum with MINIMUM CELLS (one lane per distinct reachable sum <= T, run in chunks;
+spare cells hold majority-vote replicas, or are blocked by the ITO plate).
+This is a hybrid intensity/feedback model, not an all-optical solver.
+An optional SIMULATED ITO IR-blocking plate (series element over the apertures) cuts
+closed-state leakage, rejects ambient IR, and blocks idle lanes; all plate numbers are assumptions.
+Programmable shutters, LED routing and camera calibration are required physically.
+Mask aperture diameter shrinks automatically if needed; geometry is unvalidated.
 """
-Non-isomorphic adiabatic text generator
-=======================================
-
-A runnable corpus-based text generator in which next-token candidates are
-scored by an n-gram language model and filtered/reweighted by several
-non-isomorphic process fragments.
-
-Conceptual mapping:
-  F       reference next-token distribution from the n-gram model
-  g_k     fragment-specific transforms of candidate/context features
-  I_k     local approximate inverse/lift (not a global inverse)
-  lambda  smooth adiabatic continuation from exploratory to selective scoring
-  D       proposed "diopathane" consistency score
-  tau     maximum permitted D score for a candidate
-
-This is an experimental algorithmic analogy, not an established physical
-model. "Diopathane" is a user-defined name for the consistency constraint.
-
-Examples:
-  python nonisomorphic_adiabatic_textgen.py corpus.txt --prompt "once upon a" --tokens 80
-  python nonisomorphic_adiabatic_textgen.py --prompt "The machine" --tokens 60
-  python nonisomorphic_adiabatic_textgen.py corpus.txt --order 4 --beam 8 --tau 0.65
-
-Only dependency: NumPy
-Install: python -m pip install numpy
-"""
-
-import argparse
-import dataclasses
-import json
 import math
 import random
-import re
-from collections import Counter, defaultdict
-from dataclasses import dataclass, field
+from bisect import bisect_right
+import csv
+import tkinter as tk
+from tkinter import ttk, messagebox
+from collections import deque, Counter
 from pathlib import Path
-from typing import Dict, Iterator, List, Optional, Sequence, Tuple
+from PIL import Image, ImageDraw, ImageTk
 
-import numpy as np
-
-TOKEN_RE = re.compile(r"[A-Za-z]+(?:['’][A-Za-z]+)*|\d+(?:\.\d+)?|[^\w\s]", re.UNICODE)
-
-BUILTIN_CORPUS = (
-    "The process begins with a simple observation of local flows. "
-    "As patterns emerge, structural constraints shape the boundary conditions. "
-    "Non-isomorphic transformations map states across mismatched dimensions. "
-    "Causal ascent drives the system toward higher informational complexity. "
-    "Through adiabatic continuation, the generator balances exploration and selective focus."
-)
-
-
-def tokenize(text: str) -> List[str]:
-    return TOKEN_RE.findall(text)
+DEFAULT_CELLS = 512
+MAX_CELLS = 1024
+MAX_SUBSET_ELEMENTS = 512
+DPI = 2540
+SIZE_MM = 20
+PX_PER_MM = 100
+DIAMETER_MM = .7
+SHOT_K = .06  # ambient-IR shot-noise coefficient (simulation)
+RANDOM_MAX = 30000  # largest random element produced by Populate
+MAX_TARGET = 20_000_000  # planner bitset limit
+MAX_EXPOSURES = 1_500_000  # refuse runs estimated longer than this
 
 
-def detokenize(tokens: Sequence[str]) -> str:
-    """Join tokens into readable text without spaces before common punctuation."""
-    out = ""
-    no_space_before = set(".,!?;:%)]}»”’")
-    no_space_after = set("([{«“‘")
-    for token in tokens:
-        if not out:
-            out = token
-        elif token in no_space_before or out[-1:] in no_space_after:
-            out += token
-        else:
-            out += " " + token
-    return out
+def grid_shape(cells):
+    cols = min(cells, math.ceil(math.sqrt(2 * cells)))
+    return cols, math.ceil(cells / cols)
 
 
-# ---------------------------------------------------------------------------
-# Sorted linked list of sentences, each linked to a cognitive instruction
-# ---------------------------------------------------------------------------
-
-PUNCT = set(".,!?;:")
-END = {".", "!", "?"}
-SPECIAL = {"<bos>", "<eos>"}
+def mm(v):
+    return round(v * PX_PER_MM)
 
 
-# ---------------------------------------------------------------------------
-# Dataset phrase modules: automatically learn phrases following "is/are/was/were"
-# and substitute them into generated continuations.
-# ---------------------------------------------------------------------------
-
-DATASET_BE_RE = re.compile(r"\b(is|are|was|were)\b(?:\s+|$)", re.IGNORECASE)
-DATASET_SENTENCE_RE = re.compile(r"(?<=[.!?])\s+|\n+")
-DATASET_WORD_RE = re.compile(r"[A-Za-z][A-Za-z'-]*")
-DATASET_STOPWORDS = {
-    "a", "an", "the", "of", "in", "on", "at", "to", "for", "by", "with",
-    "from", "as", "and", "or", "but", "that", "this", "these", "those",
-    "it", "its", "they", "their", "he", "she", "we", "you", "i", "be",
-    "been", "being", "has", "have", "had", "do", "does", "did", "not", "no",
-    "can", "could", "may", "might", "will", "would", "shall", "should", "must",
-    "than", "then", "also", "often", "very", "which", "who", "what", "when",
-}
-
-
-def extract_dataset_modules(corpus_text: str, max_words: int = 12) -> list:
-    """Extract frequent short definition phrases following forms of 'to be'."""
-    counts = Counter()
-    for sentence in DATASET_SENTENCE_RE.split(corpus_text):
-        sentence = re.sub(r"\s+", " ", sentence).strip()
-        if not sentence or sentence.startswith("###"):
-            continue
-        match = DATASET_BE_RE.search(sentence)
-        if not match:
-            continue
-        tail = re.split(r"[.!?;]", sentence[match.end():], maxsplit=1)[0]
-        tail = re.sub(r"\([^)]*\)", " ", tail).strip(" ,:;—–-\t")
-        tail = re.sub(r"^(?:(?:a|an|the)\s+)+", "", tail, flags=re.IGNORECASE)
-        words = DATASET_WORD_RE.findall(tail)[:max_words]
-        if not words or not any(w.lower() not in DATASET_STOPWORDS for w in words):
-            continue
-        phrase = " ".join(words).lower().strip()
-        if len(phrase) >= 3:
-            counts[phrase] += 1
-    return [
-        {"phrase": phrase, "frequency": count,
-         "words": [w.lower() for w in DATASET_WORD_RE.findall(phrase)]}
-        for phrase, count in counts.most_common()
-    ]
+def make_mask(cells=DEFAULT_CELLS):
+    if not 1 <= cells <= MAX_CELLS:
+        raise ValueError(f'Cells must be 1..{MAX_CELLS}.')
+    cols, rows = grid_shape(cells)
+    pitchx, pitchy = 16 / cols, 16 / rows
+    diameter = min(DIAMETER_MM, pitchx / 4.5, pitchy / 4)
+    dx, dy = pitchx * .25, pitchy * .16
+    image = Image.new('1', (mm(SIZE_MM), mm(SIZE_MM)), 0)
+    draw = ImageDraw.Draw(image)
+    layout = []
+    r = mm(diameter) / 2
+    for i in range(cells):
+        cx, cy = 2 + (i % cols + .5) * pitchx, 2 + (i // cols + .5) * pitchy
+        for label, ox, oy in [('a', -dx, -dy), ('b', 0, -dy), ('carry', dx, -dy),
+                              ('ref_A', -dx / 2, dy), ('ref_B', dx / 2, dy)]:
+            x, y = mm(cx + ox), mm(cy + oy)
+            draw.ellipse((x - r, y - r, x + r, y + r), fill=1)
+            layout.append((i + 1, label, cx + ox, cy + oy, diameter))
+    for x, y in [(1, 1), (19, 1), (1, 19), (19, 19)]:
+        x, y = mm(x), mm(y)
+        draw.line((x - mm(.3), y, x + mm(.3), y), fill=1, width=mm(.06))
+        draw.line((x, y - mm(.3), x, y + mm(.3)), fill=1, width=mm(.06))
+    draw.rectangle((mm(1.6), mm(.9), mm(1.8), mm(1.1)), fill=1)
+    meta = dict(cells=cells, cols=cols, rows=rows, diameter=diameter, pitchx=pitchx, pitchy=pitchy)
+    return image, layout, meta
 
 
-def load_dataset_modules(corpus_text: str, modules_path: str = "modules.json") -> list:
-    """Load modules.json, or build it automatically from the supplied corpus."""
-    path = Path(modules_path)
-    if path.is_file():
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-            modules = data.get("modules", []) if isinstance(data, dict) else data
-            modules = [m for m in modules if isinstance(m, dict) and m.get("phrase")]
-            if modules:
-                return modules
-        except (OSError, json.JSONDecodeError, AttributeError):
-            print(f"[warn] Could not read {path}; rebuilding dataset modules.")
-
-    modules = extract_dataset_modules(corpus_text)
-    if modules:
-        data = {
-            "module_count": len(modules),
-            "modules": modules,
-            "source": "automatically extracted from corpus",
-        }
-        try:
-            path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-            print(f"[dataset modules] Extracted {len(modules)} phrases -> {path}")
-        except OSError as exc:
-            print(f"[warn] Could not save {path}: {exc}")
-    return modules
-
-
-def choose_dataset_phrase(subject: str, prompt: str, modules: list, used: Counter) -> str:
-    """Choose a relevant dataset phrase using context overlap and frequency."""
-    if not modules:
-        return ""
-    context_words = {
-        w.lower() for w in DATASET_WORD_RE.findall(subject + " " + prompt)
-        if w.lower() not in DATASET_STOPWORDS
-    }
-    ranked = []
-    for module in modules:
-        phrase = str(module.get("phrase", "")).strip()
-        if not phrase:
-            continue
-        words = set(str(w).lower() for w in module.get("words", DATASET_WORD_RE.findall(phrase)))
-        words -= DATASET_STOPWORDS
-        overlap = len(context_words & words)
-        # Light prefix matching helps concepts such as algebra/algebraic match.
-        fuzzy_overlap = sum(
-            1 for context_word in context_words
-            if context_word not in words and any(
-                len(context_word) >= 5 and len(word) >= 5 and
-                (context_word.startswith(word[:5]) or word.startswith(context_word[:5]))
-                for word in words
-            )
-        )
-        frequency = max(1, int(module.get("frequency", 1)))
-        # Prefer contextual matches, common dataset phrases, and less-repeated phrases.
-        score = ((overlap + 0.7 * fuzzy_overlap) * 3.0) + min(1.0, frequency / 20.0) - (used[phrase.lower()] * 0.8)
-        ranked.append((score, frequency, phrase))
-    if not ranked:
-        return ""
-    ranked.sort(reverse=True)
-    best_score = ranked[0][0]
-    shortlist = [item for item in ranked if item[0] >= best_score - 0.25][:8]
-    # Deterministic tie-breaking: choose the least-used/highest-frequency candidate.
-    shortlist.sort(key=lambda item: (used[item[2].lower()], -item[1], item[2]))
-    phrase = shortlist[0][2]
-    used[phrase.lower()] += 1
-    return phrase
+def export_mask(folder, cells=DEFAULT_CELLS):
+    folder = Path(folder)
+    folder.mkdir(parents=True, exist_ok=True)
+    image, layout, meta = make_mask(cells)
+    stem = f'physical_adder_mask_20mm_{cells}cells'
+    path = folder / (stem + '.png')
+    image.save(path, dpi=(DPI, DPI))
+    with (folder / (stem + '.csv')).open('w', newline='') as f:
+        w = csv.writer(f)
+        w.writerow(['cell', 'aperture', 'x_mm', 'y_mm', 'diameter_mm'])
+        w.writerows(layout)
+    (folder / (stem + '_notes.txt')).write_text(
+        f'20 x 20 mm at {DPI} DPI; 2000 x 2000 pixels.\n'
+        f'{cells} cells in {meta["cols"]} columns x {meta["rows"]} rows; last row may be partial.\n'
+        f'Aperture diameter: {meta["diameter"]:.6f} mm nominal.\n'
+        f'Cell pitch: {meta["pitchx"]:.6f} x {meta["pitchy"]:.6f} mm.\n'
+        'White=open; black=opaque. Print actual size, no fit-to-page. Verify scale.\n'
+        'Upper holes a,b,carry; lower holes reference A,B.\n'
+        'All occupied cells identical; no factors/products/subsets encoded.\n'
+        'Subset assignment lives in the shutter pattern, not in the mask.\n'
+        'ITO IR-blocking plate is a simulation parameter set only; not part of this mask geometry.\n'
+        'Proposed geometry only. Smaller holes require appropriate fabrication and imaging.\n'
+        'Requires programmable shutters/SLM, separate LED routing and calibrated camera.\n'
+        'Verify mask opacity at operating IR wavelength.\n')
+    return path, image, meta
 
 
-def substitute_dataset_modules(text: str, prompt: str, modules: list) -> str:
-    """Replace generated text after is/are/was/were with learned dataset phrases."""
-    if not text or not modules:
-        return text
-    used = Counter()
-    lines = text.splitlines()
-    if len(lines) > 1:
-        # Rewrite the prompt too: a prompt ending in "is" is a definition slot.
-        rewritten = [_substitute_line(lines[0], prompt, modules, used)]
-        for line in lines[1:]:
-            if line.strip().startswith("==") or not line.strip():
-                rewritten.append(line)
-                continue
-            rewritten.append(_substitute_line(line, prompt, modules, used))
-        return "\n".join(rewritten)
+class Optics:
+    def __init__(self, loss=1.0, leak=0.0, noise=0.0, seed=None):
+        self.loss, self.leak, self.noise = loss, leak, noise
+        self.rng = random.Random(seed)
+        self.gates = 0
 
-    # Inline output: if the prompt itself contains a definition slot, rewrite it;
-    # otherwise preserve the exact prompt prefix and process only the continuation.
-    if text.startswith(prompt):
-        if DATASET_BE_RE.search(prompt):
-            rewritten_prompt = _substitute_line(prompt, prompt, modules, used)
-            remainder = text[len(prompt):]
-            return rewritten_prompt + _substitute_line(remainder, prompt, modules, used)
-        prefix = prompt
-        remainder = text[len(prompt):]
-        return prefix + _substitute_line(remainder, prompt, modules, used)
-    return _substitute_line(text, prompt, modules, used)
+    def _fix(self, p, q):
+        self.gates += 1
+        p = min(1.0, p * self.loss + self.leak)
+        q = min(1.0, q * self.loss + self.leak)
+        return (p, q)
 
+    def AND(self, *xs):
+        p = 1.0
+        for x in xs:
+            p *= x[0]
+        q = sum(x[1] for x in xs)
+        return self._fix(p, min(1.0, q))
 
-def _substitute_line(line: str, prompt: str, modules: list, used: Counter) -> str:
-    matches = list(DATASET_BE_RE.finditer(line))
-    if not matches:
-        return line
-    # Replace the phrase after the final copula in the line, avoiding repeated
-    # rewrites of earlier clauses and preserving any final punctuation.
-    match = matches[-1]
-    tail_start = match.end()
-    tail = line[tail_start:]
-    punctuation_match = re.search(r"[.!?](?:[\"'’)]*)\s*$", tail)
-    punctuation = ""
-    if punctuation_match:
-        punctuation = punctuation_match.group(0)
-        tail = tail[:punctuation_match.start()]
-    subject = line[:match.start()].strip()
-    phrase = choose_dataset_phrase(subject, prompt, modules, used)
-    if not phrase:
-        return line
-    prefix = line[:tail_start]
-    if prefix and not prefix[-1].isspace():
-        prefix += " "
-    return prefix + phrase + punctuation
+    def OR(self, *xs):
+        q = 1.0
+        for x in xs:
+            q *= x[1]
+        p = sum(x[0] for x in xs)
+        return self._fix(min(1.0, p), q)
+
+    @staticmethod
+    def NOT(x):
+        return (x[1], x[0])
+
+    def XOR(self, x, y):
+        return self.OR(self.AND(x, self.NOT(y)), self.AND(self.NOT(x), y))
+
+    def XNOR(self, x, y):
+        return self.NOT(self.XOR(x, y))
+
+    def full_add(self, a, b, c):
+        t = self.XOR(a, b)
+        return self.XOR(t, c), self.OR(self.AND(a, b), self.AND(c, t))
 
 
-def _content(tok: str) -> bool:
-    return len(tok) > 3 and tok not in PUNCT
+ONE, ZERO = (1.0, 0.0), (0.0, 1.0)
 
 
-# ---------------------------------------------------------------------------
-# Markovlets: tiny, self-contained Markov chains learned from natural text.
-#
-# A markovlet knows only the transitions of the fragment it was learned from
-# (a sentence, or a module's output). Because every transition comes from real
-# text, anything a markovlet walk emits is a continuation that actually
-# occurred. Markovlets compose: merge / restrict / join build new markovlets
-# out of old ones without ever touching the source text again.
-# ---------------------------------------------------------------------------
-
-MARKOV_ORDER = 3          # order-1 chains share contexts, so fragments can recombine
+def bits_of(v, w):
+    return [ONE if (v >> k) & 1 else ZERO for k in range(w)]
 
 
-def _norm(d: Optional[Dict[str, float]]) -> Dict[str, float]:
-    if not d:
-        return {}
-    total = sum(d.values())
-    return {t: c / total for t, c in d.items()} if total > 0 else {}
+def multiply(o, a, b):
+    W = len(a) + len(b)
+    acc = [ZERO] * W
+    for i, ai in enumerate(a):
+        row = [o.AND(ai, bj) for bj in b]
+        c = ZERO
+        for k in range(i, i + len(b) + 1):
+            y = row[k - i] if k - i < len(row) else ZERO
+            acc[k], c = o.full_add(acc[k], y, c)
+    return acc
 
 
-def _mix(a: Dict[str, float], b: Dict[str, float], w: float) -> Dict[str, float]:
-    a, b = _norm(a), _norm(b)
-    if a and b:
-        return {t: (1.0 - w) * a.get(t, 0.0) + w * b.get(t, 0.0) for t in set(a) | set(b)}
-    return dict(a or b)
+class ITOPlate:
+    """Simulated ITO IR-blocking plate in series with every aperture.
 
+    extinction_db : attenuation of a blocked aperture (adds to the shutter's own leak)
+    loss          : fractional insertion loss of an open aperture
+    reject_db     : rejection of ambient/stray IR entering through the plate
+    tau_us        : electro-optic response time constant
+    settle_us     : wait before each exposure; unsettled apertures keep a residual of
+                    the previous state, exp(-settle/tau)
+    Idle lanes (chunk padding) are driven blocked, so they add no stray light.
+    All numbers are assumptions; real ITO gating is weaker and slower than a shutter.
+    """
+    def __init__(self, enabled=False, extinction_db=20., loss=.08, reject_db=15., tau_us=50., settle_us=250.):
+        self.enabled = bool(enabled)
+        self.extinction_db, self.loss = extinction_db, loss
+        self.reject_db, self.tau_us, self.settle_us = reject_db, tau_us, settle_us
 
-class Markovlet:
-    def __init__(self, name: str, order: int = MARKOV_ORDER,
-                 trans: Optional[Dict[Tuple[str, ...], Dict[str, float]]] = None,
-                 starts: Optional[Dict[str, float]] = None,
-                 sources: Optional[List[str]] = None):
-        self.name = name
-        self.order = order
-        self.trans = trans if trans is not None else {}
-        self.starts = starts if starts is not None else {}
-        self.sources = sources if sources is not None else [name]
-        self.bridges: List[str] = []          # shared tokens found by join()
-
-    # -- construction -------------------------------------------------------
-    @classmethod
-    def from_tokens(cls, name: str, tokens: Sequence[str], order: int = MARKOV_ORDER) -> "Markovlet":
-        m = cls(name, order)
-        toks = list(tokens)
-        if not toks:
-            return m
-        m.starts[toks[0]] = 1.0
-        for i in range(1, len(toks)):
-            for n in range(1, order + 1):
-                if i - n < 0:
-                    break
-                d = m.trans.setdefault(tuple(toks[i - n:i]), {})
-                d[toks[i]] = d.get(toks[i], 0.0) + 1.0
-        return m
-
-    # -- queries ------------------------------------------------------------
     @property
-    def vocab(self) -> set:
-        v = set(self.starts)
-        for ctx, d in self.trans.items():
-            v.update(ctx)
-            v.update(d)
-        return v
+    def p_on(self):
+        return 1.0 - self.loss
 
-    def is_empty(self) -> bool:
-        return not self.trans
+    @property
+    def p_off(self):
+        return 10 ** (-self.extinction_db / 10)
 
-    def successors(self, history: Sequence[str]) -> Dict[str, float]:
-        """Longest-context lookup with backoff inside this markovlet only."""
-        for n in range(min(self.order, len(history)), 0, -1):
-            d = self.trans.get(tuple(history[-n:]))
-            if d:
-                return d
-        return {}
+    @property
+    def ambient_factor(self):
+        return 10 ** (-self.reject_db / 10)
 
-    # -- algebra ------------------------------------------------------------
-    def merge(self, other: "Markovlet", w: float = 0.5, name: Optional[str] = None) -> "Markovlet":
-        out = Markovlet(name or f"merge({self.name},{other.name})",
-                        max(self.order, other.order), sources=self.sources + other.sources)
-        for ctx in set(self.trans) | set(other.trans):
-            out.trans[ctx] = _mix(self.trans.get(ctx, {}), other.trans.get(ctx, {}), w)
-        out.starts = _mix(self.starts, other.starts, w)
-        return out
+    @property
+    def decay(self):
+        return math.exp(-self.settle_us / self.tau_us) if self.tau_us > 0 else 0.0
 
-    def restrict(self, keep, name: Optional[str] = None) -> "Markovlet":
-        """Sub-markovlet whose transitions only lead to tokens passing `keep`."""
-        out = Markovlet(name or f"restrict({self.name})", self.order, sources=list(self.sources))
-        for ctx, d in self.trans.items():
-            nd = {t: c for t, c in d.items() if keep(t)}
-            if nd:
-                out.trans[ctx] = nd
-        out.starts = {t: c for t, c in self.starts.items() if keep(t)}
-        return out
-
-    def join(self, other: "Markovlet", name: Optional[str] = None) -> "Markovlet":
-        """Overlap join: chains connect through tokens they share, and every
-        sentence-end of this chain gets an edge into the other's start."""
-        out = self.merge(other, 0.5, name or f"join({self.name},{other.name})")
-        for e in END:
-            if e in self.vocab:
-                d = out.trans.setdefault((e,), {})
-                for t, c in _norm(other.starts).items():
-                    d[t] = d.get(t, 0.0) + c
-        out.bridges = sorted(self.vocab & other.vocab)
-        return out
-
-    # -- serialisation ------------------------------------------------------
-    def to_dict(self) -> Dict[str, object]:
-        return {
-            "name": self.name, "order": self.order, "sources": self.sources,
-            "starts": self.starts, "bridges": self.bridges,
-            "trans": {" ".join(ctx): d for ctx, d in self.trans.items()},
-        }
-
-    def stats(self) -> Dict[str, object]:
-        return {"name": self.name, "contexts": len(self.trans), "vocab": len(self.vocab),
-                "sources": len(self.sources), "bridges": len(self.bridges)}
+    def step(self, cur, bit):
+        target = self.p_on if bit else self.p_off
+        return target + (cur - target) * self.decay
 
 
-def fold_merge(chains: Sequence[Markovlet], name: str) -> Markovlet:
-    """Equal-weight merge of any number of markovlets."""
-    chains = list(chains)
-    out = chains[0]
-    for i, c in enumerate(chains[1:], start=2):
-        out = out.merge(c, 1.0 / i)
-    out = Markovlet(name, out.order, out.trans, out.starts, out.sources)
+class CameraBench:
+    def __init__(self, cells=DEFAULT_CELLS, exposure=.22, leak=.001, noise=.002, seed=1, led_a=True, led_b=True,
+                 ito=None, ambient=.04, xtalk=.02):
+        self.cells = cells
+        self.exposure, self.leak, self.noise = exposure, leak, noise
+        self.rng = random.Random(seed)
+        self.led_a, self.led_b = led_a, led_b
+        self.ito = ito if ito is not None else ITOPlate(False)
+        self.ambient, self.xtalk = ambient, xtalk
+        self.itx = [[self.ito.p_off] * 5 for _ in range(cells)] if self.ito.enabled else None
+        self.pbits = [[0] * 5 for _ in range(cells)] if self.ito.enabled else None
+        self.exposures = 0
+        self.last = None
+        self.worst_margin = 0.0
+        self.err_sq, self.err_n = 0.0, 0
+        self.plate_time_us = 0.0
+        self.slots_useful = self.slots_replica = self.slots_idle = 0
+        self.corrected = 0  # lanes fixed by replica majority vote
+
+    @property
+    def rms_error(self):
+        return math.sqrt(self.err_sq / self.err_n) if self.err_n else 0.0
+
+    def capture(self, inputs, active=None, replicas=0):
+        n = self.cells
+        if len(inputs) != n:
+            raise ValueError(f'Exactly {self.cells} input cells required.')
+        act = [True] * n if active is None else list(active)
+        if len(act) != n:
+            raise ValueError(f'Exactly {n} active flags required.')
+        n_act = sum(act)
+        self.slots_useful += n_act - replicas
+        self.slots_replica += replicas
+        self.slots_idle += n - n_act
+        changed = False  # does any plate aperture need to switch this exposure?
+        ito = self.ito
+        use = ito.enabled
+        ambient = self.ambient * (ito.ambient_factor if use else 1.0)
+        dark = .01 + ambient
+        noise = math.sqrt(self.noise ** 2 + SHOT_K ** 2 * ambient)
+        pe = self.exposure
+        lit = sum(act) if use else n  # plate blocks idle lanes; without it every lane is lit
+        stray = self.xtalk * pe * lit / n
+        p_on = ito.p_on if use else 1.0
+        closed = self.leak * (ito.p_off if use else 1.0)  # closed-aperture transmission
+        lam = closed / p_on                                # closed/open ratio used by the decoder
+        A, B = float(self.led_a), float(self.led_b)
+        t = lambda x: self.leak + (1 - self.leak) * x
+
+        def pixel(v):
+            return max(0., min(1., v + self.rng.gauss(0, noise)))
+        rows = []
+        for i, (a, b, c) in enumerate(inputs):
+            if any(x not in (0, 1) for x in (a, b, c)):
+                raise ValueError('Binary inputs required.')
+            if use:
+                idle = not act[i]
+                bits = (0, 0, 0, 0, 0) if idle else (a, b, c, 1, 1)
+                st = self.itx[i]
+                if list(bits) != self.pbits[i]:
+                    changed = True
+                    self.pbits[i][:] = bits
+                for j in range(5):
+                    st[j] = ito.step(st[j], bits[j])
+                pa, pb, pc, pra, prb = st
+            else:
+                pa = pb = pc = pra = prb = 1.0
+            rows.append(dict(signal=pixel(dark + stray + pe * (A * (t(a) * pa + t(b) * pb) + B * t(c) * pc)),
+                             black=pixel(dark), refa=pixel(dark + stray + pe * A * pra),
+                             refb=pixel(dark + stray + pe * B * prb),
+                             baseline=pixel(dark + stray + pe * closed * (2 * A + B))))
+        self.exposures += 1
+        if use and changed:  # settle wait only when some aperture actually switched
+            self.plate_time_us += ito.settle_us
+        decoded = []
+        for i, row in enumerate(rows):
+            if use and not act[i]:
+                decoded.append(dict(level=0.0, k=0, sum=0, carry=0))
+                continue
+            Ar, Br = row['refa'] - row['black'], row['refb'] - row['black']
+            if min(Ar, Br) < .04 or abs(Ar - Br) > .25 * max(Ar, Br):
+                raise RuntimeError('Insufficient/unequal LED references.')
+            level = (row['signal'] - row['baseline']) / ((Ar + Br) / 2 * (1 - lam))
+            k = round(level)
+            self.worst_margin = max(self.worst_margin, abs(level - k))
+            self.err_sq += (level - k) ** 2
+            self.err_n += 1
+            if row['signal'] > .98 or not 0 <= k <= 3 or abs(level - k) > .35:
+                raise RuntimeError('Ambiguous/saturated camera level. Adjust exposure/noise/plate.')
+            decoded.append(dict(level=level, k=k, sum=k % 2, carry=int(k >= 2)))
+        self.last = dict(inputs=list(inputs), rows=rows, decoded=decoded)
+        return decoded
+
+
+def ito_ab_test(base, plate_kw, cells=64, exposures=2000, seed=7):
+    """Same random full-adder exposures with and without the ITO plate.
+    A quarter of the lanes are idle (like chunk padding)."""
+    out = {}
+    for label, enabled in (('without plate', False), ('with plate', True)):
+        bench = CameraBench(cells, ito=ITOPlate(enabled, **plate_kw), **base)
+        rng = random.Random(seed)
+        active = [i < cells - cells // 4 for i in range(cells)]
+        aborted = wrong = 0
+        for _ in range(exposures):
+            inputs = [(rng.getrandbits(1), rng.getrandbits(1), rng.getrandbits(1)) if active[i] else (0, 0, 0)
+                      for i in range(cells)]
+            try:
+                dec = bench.capture(inputs, active)
+            except RuntimeError:
+                aborted += 1
+                continue
+            wrong += sum(1 for i in range(cells) if active[i] and dec[i]['k'] != sum(inputs[i]))
+        out[label] = dict(aborted=aborted, wrong=wrong, worst=bench.worst_margin, rms=bench.rms_error,
+                          plate_ms=bench.plate_time_us / 1000)
     return out
 
 
-# ---------------------------------------------------------------------------
-# Modules: each one CONSTRUCTS a markovlet from its inputs (markovlet algebra),
-# walks it, and publishes the markovlet it learned from its own output.
-# ---------------------------------------------------------------------------
-
-@dataclass(frozen=True)
-class ModuleResult:
-    module: str
-    provides: str
-    node_idx: int
-    pass_no: int
-    tokens: Tuple[str, ...]
-    text: str
-    markovlet: Markovlet              # markovlet learned from this module's output
-    chain: str                        # provenance of the chain that was walked
-    natural_rate: float               # share of in-segment bigrams seen in the corpus
-    novelty: float                    # share of tokens NOT inside a verbatim corpus 4-gram
-    features: Dict[str, object]
-    consumed: Tuple[str, ...]
-    missing: Tuple[str, ...]
-    injected: int                     # unused, kept for report compatibility
-    fallbacks: int                    # steps where the chain dead-ended
-    closed: bool
-
-
-def result_to_dict(r: ModuleResult) -> Dict[str, object]:
-    d = {k: getattr(r, k) for k in ("module", "provides", "node_idx", "pass_no", "text",
-                                     "chain", "natural_rate", "novelty", "features", "consumed",
-                                     "missing", "fallbacks", "closed")}
-    d["tokens"] = list(r.tokens)
-    d["markovlet"] = r.markovlet.to_dict()
-    return d
-
-
-@dataclass
-class ModuleInput:
-    history: Tuple[str, ...]
-    node: "SentenceNode"
-    nxt: Optional["SentenceNode"]
-    upstream: Dict[str, ModuleResult]
-    all_vocab: frozenset
-    ngrams: Dict[int, set] = field(default_factory=dict)   # corpus n-grams by length
-    tokens: List[str] = field(default_factory=list)
-    steps: int = 0
-    state: Dict[str, object] = field(default_factory=dict)
-
-    def up(self, key: str) -> Optional[ModuleResult]:
-        return self.upstream.get(key)
-
-    def prev(self) -> str:
-        if self.tokens:
-            return self.tokens[-1]
-        return self.history[-1] if self.history else ""
-
-
-class Module:
-    name = "NOOP"
-    provides = "noop"
-    requires: Tuple[str, ...] = ()
-    min_steps = 4
-    max_steps = 20
-    max_copy: Optional[int] = None    # longest verbatim corpus run allowed (None = unlimited)
-
-    def admit(self, io: ModuleInput, token: str) -> bool:
-        """Hard filter applied to every candidate, whatever its source."""
-        return True
-
-    def construct(self, io: ModuleInput) -> Markovlet:
-        """Build the markovlet this module will walk."""
-        return io.node.markov
-
-    def begin(self, io: ModuleInput) -> None: pass
-    def adjust(self, io: ModuleInput, token: str, score: float) -> float: return score
-    def on_emit(self, io: ModuleInput, token: str) -> None: pass
-    def features(self, io: ModuleInput) -> Dict[str, object]: return {}
-
-    def done(self, io: ModuleInput, token: str) -> bool:
-        return (token in END and io.steps >= self.min_steps) or io.steps >= self.max_steps
-
-
-def _content_words(res: Optional[ModuleResult]) -> set:
-    return set(res.features.get("content", [])) if res else set()
-
-
-def _upstream_chains(io: ModuleInput, keys: Sequence[str]) -> List[Markovlet]:
-    return [io.up(k).markovlet for k in keys if io.up(k)]
-
-
-class Observe(Module):
-    """Walk the node's own markovlet: a faithful restatement of local flow."""
-    name, provides, requires = "OBSERVE", "observation", ()
-    min_steps = 3
-    max_copy = None            # observing IS faithful copying
-
-    def features(self, io):
-        return {"content": sorted({t for t in io.tokens if _content(t)})}
-
-
-class Describe(Module):
-    """Walk the node's markovlet with the observation's content words cut out
-    (restrict), so the segment can only add new attributes."""
-    name, provides, requires = "DESCRIBE", "description", ("observation",)
-    max_copy = 3
-
-    def admit(self, io, token):
-        return not (_content(token) and token in io.state.get("used", ()))
-
-    def construct(self, io):
-        seen = _content_words(io.up("observation"))
-        io.state["used"] = set(seen)
-        chain = io.node.markov.restrict(lambda t: t not in seen) if seen else io.node.markov
-        return chain
-
-    def adjust(self, io, token, score):
-        if _content(token):
-            return score + (-2.0 if token in io.state["used"] else 0.8)
-        return score
-
-    def on_emit(self, io, token):
-        if _content(token):
-            io.state["used"].add(token)
-
-    def features(self, io):
-        return {"content": sorted({t for t in io.tokens if _content(t)})}
-
-
-class Relate(Module):
-    """Join this node's markovlet to the next node's (overlap join), blended
-    with the description markovlet. Done once a next-node-only word was used."""
-    name, provides, requires = "RELATE", "relation", ("description",)
-    min_steps = 5
-    max_steps = 22
-    max_copy = 3
-
-    def construct(self, io):
-        chain = io.node.markov.join(io.nxt.markov) if io.nxt else io.node.markov
-        desc = io.up("description")
-        if desc:
-            chain = chain.merge(desc.markovlet, 0.25)
-        mine = set(io.node.tokens)
-        only_next = {t for t in (io.nxt.tokens if io.nxt else []) if _content(t) and t not in mine}
-        io.state.update(only_next=only_next, bridged=not only_next, bridge_word=None)
-        return chain
-
-    def adjust(self, io, token, score):
-        if not io.state["bridged"] and io.steps >= 2 and token in io.state["only_next"]:
-            return score + 2.0
-        return score
-
-    def on_emit(self, io, token):
-        if token in io.state["only_next"] and io.state["bridge_word"] is None:
-            io.state["bridged"], io.state["bridge_word"] = True, token
-
-    def done(self, io, token):
-        return (token in END and io.steps >= self.min_steps and io.state["bridged"]) \
-            or io.steps >= self.max_steps
-
-    def features(self, io):
-        return {"bridge_word": io.state["bridge_word"]}
-
-
-class Abstract(Module):
-    """Restrict both the node's and the relation's markovlets to long words and
-    short function words, merge them, and walk. Done after two long words."""
-    name, provides, requires = "ABSTRACT", "abstraction", ("relation",)
-    min_steps = 4
-    max_steps = 24
-    max_copy = 2
-
-    def admit(self, io, token):
-        return self._keep(token)
-
-    @staticmethod
-    def _keep(t: str) -> bool:
-        return t in PUNCT or len(t) <= 3 or len(t) >= 7
-
-    def construct(self, io):
-        chain = io.node.markov.restrict(self._keep)
-        rel = io.up("relation")
-        if rel:
-            chain = chain.merge(rel.markovlet.restrict(self._keep), 0.5)
-        io.state["longs"] = 0
-        return chain
-
-    def adjust(self, io, token, score):
-        return score + (1.0 if len(token) >= 7 else 0.0)
-
-    def on_emit(self, io, token):
-        if len(token) >= 7 and token not in PUNCT:
-            io.state["longs"] += 1
-
-    def done(self, io, token):
-        return (token in END and io.steps >= self.min_steps and io.state["longs"] >= 2) \
-            or io.steps >= self.max_steps
-
-    def features(self, io):
-        return {"long_words": [t for t in io.tokens if len(t) >= 7 and t not in PUNCT]}
-
-
-class Synthesize(Module):
-    """Equal-weight merge of the description and abstraction markovlets."""
-    name, provides, requires = "SYNTHESIZE", "synthesis", ("description", "abstraction")
-    min_steps = 6
-    max_copy = 2
-
-    def construct(self, io):
-        parts = _upstream_chains(io, self.requires) or [io.node.markov]
-        return fold_merge(parts, "synthesis-chain")
-
-    def features(self, io):
-        return {"content": sorted({t for t in io.tokens if _content(t)})}
-
-
-class Reflect(Module):
-    """Merge every upstream markovlet into one memory chain and walk it."""
-    name, provides = "REFLECT", "reflection"
-    requires = ("observation", "description", "relation", "abstraction", "synthesis")
-    max_copy = 3
-
-    def construct(self, io):
-        parts = _upstream_chains(io, self.requires) or [io.node.markov]
-        return fold_merge(parts, "memory-chain")
-
-    def features(self, io):
-        return {"recalled_from": [k for k in self.requires if io.up(k)]}
-
-
-INSTRUCTIONS: List[Module] = [Observe(), Describe(), Relate(), Abstract(), Synthesize(), Reflect()]
-MODULES: Dict[str, Module] = {m.name: m for m in INSTRUCTIONS}
-
-
-def check_dependencies(order: Sequence[Module]) -> List[str]:
-    provided = {m.provides for m in order}
-    return [f"{m.name} requires '{r}' but no module provides it"
-            for m in order for r in m.requires if r not in provided]
-
-
-def logsumexp(values: Sequence[float]) -> float:
-    """Stable log(sum(exp(v))). Plain log(exp(x)) would overflow and is just x."""
-    if not values:
-        return 0.0
-    m = max(values)
-    return m + math.log(sum(math.exp(v - m) for v in values))
-
-
-class SentenceNode:
-    __slots__ = ("text", "tokens", "score", "instruction", "next", "markov")
-
-    def __init__(self, text: str, tokens: List[str], score: float):
-        self.text = text
-        self.tokens = tokens
-        self.score = score                      # log(sum(exp(token surprisal)))
-        self.instruction: Module = INSTRUCTIONS[0]
-        self.next: Optional["SentenceNode"] = None
-        self.markov: Markovlet = Markovlet.from_tokens("sentence", tokens)
-
-
-class SortedSentenceList:
-    """Singly linked list kept in ascending score order (causal ascent)."""
-
-    def __init__(self) -> None:
-        self.head: Optional[SentenceNode] = None
-        self.size = 0
-
-    def insert(self, node: SentenceNode) -> None:
-        if self.head is None or node.score < self.head.score:
-            node.next = self.head
-            self.head = node
-        else:
-            cur = self.head
-            while cur.next is not None and cur.next.score <= node.score:
-                cur = cur.next
-            node.next = cur.next
-            cur.next = node
-        self.size += 1
-
-    def extend_sorted(self, nodes: Sequence[SentenceNode]) -> None:
-        """Bulk build: sort once, link with a tail pointer (O(n log n) instead of
-        O(n^2) repeated insert()). Result is the same sorted linked list."""
-        tail = None
-        for node in sorted(nodes, key=lambda n: n.score):    # stable: ties keep corpus order
-            node.next = None
-            if tail is None:
-                self.head = node
-            else:
-                tail.next = node
-            tail = node
-            self.size += 1
-
-    def __iter__(self) -> Iterator[SentenceNode]:
-        cur = self.head
-        while cur is not None:
-            yield cur
-            cur = cur.next
-
-    def link_instructions(self, order: Optional[Sequence[Module]] = None,
-                          assign: str = "cycle") -> None:
-        """Attach a module to every node.
-
-        cycle  (default): rank % len(order) -> consecutive nodes run OBSERVE,
-                          DESCRIBE, RELATE, ... so every module appears within the
-                          first len(order) nodes, however large the corpus is, and
-                          each module's upstream result is the node just before it.
-        blocks:           old behaviour, one contiguous block of nodes per module.
-                          On a large corpus the token budget is spent inside the
-                          first block, so later modules never run.
-        """
-        order = list(order) if order else INSTRUCTIONS
-        for rank, node in enumerate(self):
-            if assign == "blocks":
-                idx = min(len(order) - 1, rank * len(order) // max(1, self.size))
-            else:
-                idx = rank % len(order)
-            node.instruction = order[idx]
-            node.markov.name = f"node{rank}"
-            node.markov.sources = [node.markov.name]
-
-
-def build_sentence_list(corpus_text: str, alpha_mix: float = 0.3,
-                        order: Optional[Sequence[Module]] = None,
-                        assign: str = "cycle") -> SortedSentenceList:
+def optical_add(bench, x, y, width, active=None, replicas=0):
+    n = bench.cells
+    if len(x) != n or len(y) != n:
+        raise ValueError(f'{n} lanes required.')
+    carry, result = [0] * n, [0] * n
+    for k in range(width):
+        inputs = [((x[i] >> k) & 1, (y[i] >> k) & 1, carry[i]) for i in range(n)]
+        ds = bench.capture(inputs, active, replicas)
+        for i, d in enumerate(ds):
+            result[i] |= d['sum'] << k
+            carry[i] = d['carry']
+        yield dict(bit=k, width=width)
+    if any(carry):
+        raise RuntimeError('Arithmetic overflow.')
+    return result
+
+
+def factor_job(bench, N, report):
+    n = bench.cells
+    wa = max(2, (n + 1) // 2)
+    wb = max(2, n - 1)
+    W = wa + wb
+
+    amax, bmax = (1 << wa) - 1, (1 << wb) - 1
+    report(f'Dynamic bit allocation: wa={wa} bits, wb={wb} bits (Total W={W} bits, Cells={n})')
+
+    candidates = list(range(2, min(amax + 1, math.isqrt(N) + 1)))
+    if not candidates:
+        candidates = [2]
+
+    for start in range(0, len(candidates), n):
+        batch = candidates[start:start + n]
+        active = [i < len(batch) for i in range(n)]
+        divisors = batch + [0] * (n - len(batch))
+        sums, counts = [0] * n, [0] * n
+        report(f'Electronic scheduler: trial divisors {batch}')
+        while any(active):
+            increments = [divisors[i] if active[i] else 0 for i in range(n)]
+            sums = yield from optical_add(bench, sums, increments, W, list(active))  # finished/idle lanes get plate-blocked
+            hits = []
+            for i in range(n):
+                if not active[i]:
+                    continue
+                counts[i] += 1
+                if sums[i] == N:
+                    hits.append((divisors[i], counts[i]))
+                    active[i] = False
+                elif sums[i] > N:
+                    active[i] = False
+            if hits:
+                return min(hits)
+    return None
+
+
+def truth_job(bench, report):
+    n = bench.cells
+    tested = 0
+    for start in range(0, 8, n):
+        ids = list(range(start, min(8, start + n)))
+        inputs = [((i >> 2) & 1, (i >> 1) & 1, i & 1) for i in ids]
+        inputs += [(0, 0, 0)] * (n - len(inputs))
+        decoded = bench.capture(inputs, [j < len(ids) for j in range(n)])  # unused lanes plate-blocked
+        yield dict(bit=0, width=1)
+        for j, i in enumerate(ids):
+            if decoded[j]['k'] != sum(inputs[j]):
+                raise RuntimeError(f'Truth table failure for {inputs[j]}')
+            tested += 1
+    return f'All {tested} full-adder combinations passed in {bench.exposures} exposure(s).'
+
+
+def popcount(v):
+    return v.bit_count() if hasattr(v, 'bit_count') else bin(v).count('1')
+
+
+def plan_subset(S, T, copies=1):
+    """CPU planner: how many lanes does each stage need, and how many cells?
+
+    Lane = one distinct reachable sum r <= T - s that must be fed into an adder.
+    Cells = peak lanes x copies (capped at MAX_CELLS). Each lane is run on
+    `copies` cells so the camera results can be majority-voted; stages that
+    don't fill the cells reuse the spare cells as extra copies. Larger stages
+    run in several chunks. Uses a big-int bitset.
     """
-    Split corpus into sentences, mix local/global token frequencies, score each
-    sentence as log(sum(exp(surprisal))), insert into a sorted linked list, and
-    link each node to a cognitive instruction.
-    """
-    raw = re.split(r'(?<=[.!?])\s+', corpus_text.strip())
-    sentences = [x.strip() for x in raw if x.strip()]
-    token_lists = [tokenize(x) for x in sentences]
-
-    global_counter: Counter = Counter()
-    for toks in token_lists:
-        global_counter.update(toks)
-    total_global = max(1, sum(global_counter.values()))
-
-    sl = SortedSentenceList()
-    nodes: List[SentenceNode] = []
-    for text, toks in zip(sentences, token_lists):
-        if not toks:
-            continue
-        local = Counter(toks)
-        total_local = max(1, len(toks))
-        surprisals = []
-        for tok in toks:
-            p_local = local[tok] / total_local
-            p_global = global_counter[tok] / total_global
-            p_mix = (1.0 - alpha_mix) * p_local + alpha_mix * p_global
-            surprisals.append(-math.log(max(p_mix, 1e-12)))
-        nodes.append(SentenceNode(text, toks, logsumexp(surprisals)))
-
-    sl.extend_sorted(nodes)
-    sl.link_instructions(order, assign)
-    return sl
-
-
-def flatten_sentence_list(sl: SortedSentenceList) -> str:
-    tokens: List[str] = []
-    for node in sl:
-        tokens.extend(node.tokens)
-    return detokenize(tokens)
-
-
-@dataclass
-class Candidate:
-    token: str
-    base_logp: float
-    score: float
-    consistency: float
-    alignment: float
-    probability: float = 0.0
-
-
-class NGramModel:
-    """Smoothed n-gram model with backoff to shorter contexts."""
-
-    def __init__(self, order: int = 3, alpha: float = 0.25):
-        self.order = max(1, int(order))
-        self.alpha = max(1e-9, float(alpha))
-        self.counts = [defaultdict(Counter) for _ in range(self.order)]
-        self.vocab = Counter()
-        self.total_tokens = 0
-
-    def train(self, text: str) -> None:
-        tokens = ["<bos>"] * (self.order - 1) + tokenize(text) + ["<eos>"]
-        if not tokens:
-            return
-        for i in range(self.order - 1, len(tokens)):
-            target = tokens[i]
-            self.vocab[target] += 1
-            self.total_tokens += 1
-            for ctx_len in range(self.order):
-                context = tuple(tokens[i - ctx_len:i]) if ctx_len else ()
-                self.counts[ctx_len][context][target] += 1
-
-    def candidates(self, context_tokens: Sequence[str], limit: int = 80) -> List[Tuple[str, float]]:
-        vocab_size = max(1, len(self.vocab))
-        context = list(context_tokens)
-        counter = Counter()
-        # Blend backoff levels; a longer context receives more weight.
-        for ctx_len in range(min(self.order - 1, len(context)), -1, -1):
-            key = tuple(context[-ctx_len:]) if ctx_len else ()
-            found = self.counts[ctx_len].get(key)
-            if not found:
-                continue
-            weight = 1.0 + 0.7 * ctx_len
-            for token, count in found.items():
-                counter[token] += weight * count
-            if ctx_len >= 1:
-                break
-        if not counter:
-            counter.update(self.vocab)
-        total = sum(counter.values())
-        ranked = []
-        for token, count in counter.items():
-            prob = (count + self.alpha) / (total + self.alpha * vocab_size)
-            ranked.append((token, math.log(max(prob, 1e-12))))
-        ranked.sort(key=lambda item: item[1], reverse=True)
-        return ranked[:max(1, limit)]
-
-
-class NonIsomorphicFragments:
-    """
-    Fragment transforms candidate features into differently sized spaces.
-    The transforms are intentionally not inverses of one another.
-    """
-
-    def __init__(self, seed: int = 17):
-        rng = np.random.default_rng()#edited
-        self.w_context = rng.normal(0, 0.7, size=(5, 3))
-        self.w_word = rng.normal(0, 0.7, size=(5, 4))
-        self.w_transition = rng.normal(0, 0.7, size=(5, 2))
-
-    @staticmethod
-    def _unit(v: np.ndarray) -> np.ndarray:
-        n = float(np.linalg.norm(v))
-        return v / n if n > 1e-12 else np.zeros_like(v)
-
-    @staticmethod
-    def _hash_features(token: str, width: int) -> np.ndarray:
-        """Stable token features; does not depend on Python's randomized hash."""
-        raw = token.lower().encode("utf-8", errors="ignore")
-        vals = np.zeros(width, dtype=float)
-        if not raw:
-            return vals
-        for i, byte in enumerate(raw):
-            vals[i % width] += ((byte % 31) - 15) / 15.0
-            vals[(i * 3 + 1) % width] += ((byte % 17) - 8) / 8.0
-        vals /= max(1, len(raw))
-        vals[0] += min(len(raw), 20) / 20.0
-        vals[1] += sum(chr(b).isalpha() for b in raw) / max(1, len(raw))
-        return np.tanh(vals)
-
-    def features(self, context: Sequence[str], token: str, logp: float, rank: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        recent = list(context[-4:])
-        ctx_vec = np.zeros(5, dtype=float)
-        if recent:
-            for i, word in enumerate(recent):
-                f = self._hash_features(word, 5)
-                ctx_vec += f * (0.65 ** (len(recent) - i - 1))
-            ctx_vec /= max(1, len(recent))
-        word_vec = self._hash_features(token, 5)
-        transition_vec = np.array([
-            np.tanh(logp),
-            1.0 / (1.0 + rank),
-            1.0 if token[:1].isupper() else 0.0,
-            1.0 if token in ".,!?;:" else 0.0,
-            min(len(token), 24) / 24.0
-        ], dtype=float)
-        
-        g1 = np.tanh(ctx_vec @ self.w_context)
-        g2 = np.tanh(word_vec @ self.w_word)
-        g3 = np.tanh(transition_vec @ self.w_transition)
-        return g1, g2, g3
-
-    def score(self, context: Sequence[str], token: str, logp: float, rank: int, lam: float) -> Tuple[float, float]:
-        g1, g2, g3 = self.features(context, token, logp, rank)
-        summaries = np.array([
-            np.linalg.norm(g1),
-            np.linalg.norm(g2),
-            np.linalg.norm(g3)
-        ])
-        mean = float(np.mean(summaries))
-        spread = float(np.std(summaries) / (mean + 1e-9))
-        consistency = float(np.clip(0.55 * spread + 0.45 * (1.0 - np.mean(summaries)), 0.0, 1.0))
-
-        ref = self._unit(np.array([
-            np.mean(g1),
-            np.mean(g2),
-            np.mean(g3),
-            np.tanh(logp),
-        ]))
-        candidate = self._unit(np.array([
-            g1[0],
-            g2[0],
-            g3[0],
-            np.tanh(logp + 0.1 * rank)
-        ]))
-        cosine = float(np.dot(ref, candidate))
-        alignment = (cosine + 1.0) / 2.0
-
-        fragment_score = 1.6 * alignment - 1.15 * consistency
-        total_score = (1.0 - lam) * (0.75 * logp + 0.25 * fragment_score) + lam * (1.25 * logp + 0.85 * fragment_score)
-        return total_score, consistency
-
-
-def adiabatic_lambda(step: int, total_steps: int) -> float:
-    u = min(1.0, max(0.0, step / max(1, total_steps - 1)))
-    return 3.0 * u * u - 2.0 * u * u * u
-
-
-def softmax(values: Sequence[float], temperature: float = 1.0) -> np.ndarray:
-    temp = max(1e-6, float(temperature))
-    arr = np.asarray(values, dtype=float) / temp
-    arr -= np.max(arr)
-    exp = np.exp(np.clip(arr, -60, 60))
-    return exp / max(float(exp.sum()), 1e-12)
-
-
-def natural_rate(model: NGramModel, tokens: Sequence[str]) -> float:
-    """Share of bigrams inside the segment that occur somewhere in the corpus."""
-    pairs = list(zip(tokens, tokens[1:]))
-    if not pairs or len(model.counts) < 2:
-        return 1.0
-    seen = sum(1 for a_, b_ in pairs if model.counts[1].get((a_,), {}).get(b_))
-    return seen / len(pairs)
-
-
-def novelty(ngrams: Dict[int, set], tokens: Sequence[str], L: int = 4) -> float:
-    """1 - (share of tokens covered by a verbatim corpus L-gram)."""
-    grams, n = ngrams.get(L, set()), len(tokens)
-    if n < L or not grams:
-        return 1.0
-    covered = set()
-    for i in range(n - L + 1):
-        if tuple(tokens[i:i + L]) in grams:
-            covered.update(range(i, i + L))
-    return 1.0 - len(covered) / n
-
-
-def run_module(
-    module: Module,
-    model: NGramModel,
-    fragments: NonIsomorphicFragments,
-    io: ModuleInput,
-    rng: random.Random,
-    *,
-    budget: int,
-    step0: int,
-    total_steps: int,
-    beam_size: int,
-    tau: float,
-    temperature: float,
-    show_trace: bool = False,
-) -> ModuleResult:
-    """Run ONE module in isolation: construct its markovlet, walk it, and
-    return a ModuleResult carrying the markovlet learned from the output."""
-    history = list(io.history)
-    chain = module.construct(io)
-    module.begin(io)
-    fallbacks = 0
-    forced_copy = 0
-    closed = False
-    forced = False
-
-    for local in range(max(1, min(module.max_steps, budget))):
-        lam = adiabatic_lambda(step0 + local, max(1, total_steps))
-
-        succ: Dict[str, float] = {}
-        if not chain.is_empty():
-            succ = dict(_norm(chain.successors(history)))
-            if io.steps == 0 and chain.starts and (not history or history[-1] in END or not succ):
-                succ = dict(_norm(chain.starts))                # entry state
-        if module.max_copy is not None and history and len(model.counts) > 1:
-            g = model.counts[1].get((history[-1],), {})         # corpus-attested bigram successors
-            gt = float(sum(g.values())) or 1.0
-            for t, c in g.items():
-                succ[t] = succ.get(t, 0.0) + 0.25 * c / gt
-        succ = {t: c for t, c in succ.items() if t not in SPECIAL and module.admit(io, t)}
-        if io.steps < module.min_steps:
-            no_end = {t: c for t, c in succ.items() if t not in END}
-            succ = no_end or succ
-        if module.max_copy is not None and succ and io.tokens:
-            seen_pairs = set(zip(io.tokens, io.tokens[1:]))      # no loops inside a segment
-            prev = io.tokens[-1]
-            unlooped = {t: c for t, c in succ.items() if (prev, t) not in seen_pairs}
-            if unlooped:
-                succ = unlooped
-        if module.max_copy is not None and succ:
-            L = module.max_copy + 1                              # cap on verbatim runs
-            grams, tail = io.ngrams.get(L, set()), tuple(history[-(L - 1):])
-            fresh = {t: c for t, c in succ.items()
-                     if len(tail) < L - 1 or (tail + (t,)) not in grams}
-            if fresh:
-                succ = fresh
-            elif ("," in model.vocab and io.steps >= 2 and history[-1] not in PUNCT
-                  and io.state.get("splices", 0) < 2):
-                io.state["splices"] = io.state.get("splices", 0) + 1
-                succ = {",": 1.0}                                # splice: break the copy with a comma,
-                                                                 # then continue from a clause start
-            else:
-                forced_copy += 1                                 # nothing but a copy was available
-
-        fell_back = not succ
-        if fell_back:                                           # dead end -> global n-gram
-            ranked = [(t, lp) for t, lp in model.candidates(history, limit=max(40, beam_size * 8))
-                      if t not in SPECIAL]
-            if io.steps < module.min_steps:
-                ranked = [(t, lp) for t, lp in ranked if t not in END] or ranked
-        else:
-            total = sum(succ.values())
-            ranked = sorted(((t, math.log(max(c / total, 1e-12))) for t, c in succ.items()),
-                            key=lambda item: item[1], reverse=True)
-
-        scored: List[Candidate] = []
-        for rank, (token, logp) in enumerate(ranked):
-            score, consistency = fragments.score(history, token, logp, rank, lam)
-            score = module.adjust(io, token, score)
-            alignment = float(np.clip((score - logp) / 2.5 + 0.5, 0.0, 1.0))
-            if consistency <= tau:
-                scored.append(Candidate(token, logp, score, consistency, alignment))
-        if not scored:
-            token, logp = ranked[0]
-            score, consistency = fragments.score(history, token, logp, 0, lam)
-            scored = [Candidate(token, logp, score, consistency, 0.5)]
-
-        scored.sort(key=lambda c: c.score, reverse=True)
-        beam = scored[:max(1, beam_size)]
-        probs = softmax([c.score for c in beam], temperature)
-        for candidate, prob in zip(beam, probs):
-            candidate.probability = float(prob)
-        chosen = beam[0] if temperature <= 0.01 else rng.choices(beam, weights=probs, k=1)[0]
-
-        history.append(chosen.token)
-        io.tokens.append(chosen.token)
-        io.steps += 1
-        module.on_emit(io, chosen.token)
-        fallbacks += int(fell_back)
-        if show_trace:
-            print(f"[{step0 + local:03d}] {module.name:<10} {chosen.token!r:<14} "
-                  f"p={math.exp(chosen.base_logp):.2f} score={chosen.score:+.3f} "
-                  f"D={chosen.consistency:.3f}{' FALLBACK' if fell_back else ''}")
-        if module.done(io, chosen.token):
-            closed = chosen.token in END
+    if T > MAX_TARGET:
+        raise ValueError(f'Target T too large for the planner (max {MAX_TARGET:,}).')
+    W = max(1, T.bit_length())
+    reach = 1  # bit v set <=> sum v reachable; start with {0}
+    lanes = []
+    for s in S:
+        if (reach >> T) & 1:
             break
-
-    if io.tokens and io.tokens[-1] not in END and io.steps >= module.max_steps:
-        if io.tokens[-1] in PUNCT:
-            io.tokens[-1] = "."                                 # never end on a dangling comma
-        else:
-            io.tokens.append(".")                               # close an over-long sentence
-        closed, forced = True, True
-
-    feats = module.features(io)
-    feats["forced_close"] = forced
-    feats["forced_copy_steps"] = forced_copy
-    feats["splices"] = io.state.get("splices", 0)
-    tokens = tuple(io.tokens)
-    needed = tuple(module.requires)
-    return ModuleResult(
-        module=module.name,
-        provides=module.provides,
-        node_idx=0,
-        pass_no=0,
-        tokens=tokens,
-        text=detokenize(tokens),
-        markovlet=Markovlet.from_tokens(module.provides, tokens),
-        chain=chain.name,
-        natural_rate=natural_rate(model, tokens),
-        novelty=novelty(io.ngrams, tokens),
-        features=feats,
-        consumed=tuple(k for k in needed if k in io.upstream),
-        missing=tuple(k for k in needed if k not in io.upstream),
-        injected=0,
-        fallbacks=fallbacks,
-        closed=closed,
-    )
+        if s == 0 or s > T:
+            continue
+        feed = reach & ((1 << (T - s + 1)) - 1)
+        lanes.append(popcount(feed))
+        reach |= feed << s
+    peak = max(lanes, default=1)
+    n = max(1, min(peak * copies, MAX_CELLS))
+    per = max(1, n // copies)  # distinct lanes per chunk
+    groups = sum(-(-l // per) for l in lanes)
+    return dict(W=W, n=n, peak=peak, lanes=lanes, per=per, copies=copies, exposures=groups * W,
+                solvable=bool((reach >> T) & 1))
 
 
-def generate(
-    model: NGramModel,
-    prompt: str,
-    token_count: int = 800,
-    beam_size: int = 8,
-    tau: float = 0.65,
-    temperature: float = 0.85,
-    seed: int = 7,
-    show_trace: bool = False,
-    sentences: Optional[SortedSentenceList] = None,
-    results: Optional[List[ModuleResult]] = None,
-    layout: str = "lines",
-    labels: bool = False,
-    arrange: str = "grouped",
-) -> str:
-    """Pipeline: walk the linked list, run each node's module, publish the
-    resulting markovlet to a blackboard that later modules compose from."""
-    rng = random.Random(seed)
-    fragments = NonIsomorphicFragments(seed)
-    output = tokenize(prompt) or ["The"]
-    prompt_line = detokenize(output)
-    entries: List[Tuple[str, str]] = []              # (module name, line) in run order
-    all_vocab = frozenset(set(model.vocab) - SPECIAL)
-    results = results if results is not None else []
-    blackboard: Dict[str, ModuleResult] = {}
+def subset_sum_job(bench, S, T, report, copies=1, redundant=True):
+    """Minimum-cell subset sum that uses every cell and the ITO plate.
 
-    if not (sentences and sentences.head):
-        raise ValueError("generate() needs a non-empty SortedSentenceList")
+    State = set of distinct reachable sums (each a lane). For every element s,
+    the CPU feeds the lanes with r <= T - s into the optical adder (r + s),
+    decodes the camera result, and keeps sums not seen before. Lanes beyond
+    the chunk size run in further chunks. Spare cells either hold replicas of
+    the lanes (redundant=True: results are majority-voted) or are idle and
+    blocked by the ITO plate (redundant=False). Stops as soon as T is reached.
+    Returns the list of chosen element indices, or None.
+    """
+    n = bench.cells
+    per = max(1, n // copies)
+    W = max(1, T.bit_length())  # r + s <= T < 2**W: overflow impossible
+    parent = {0: -1}  # sum -> index of the element that first produced it
+    order = [0]       # sorted reachable sums
+    report(f'Minimum-cell subset sum: {n} cells, {per} lanes/chunk, W={W} bits, {len(S)} elements, '
+           f'spare cells: {"vote replicas" if redundant else "plate-blocked"}')
+    for j, s in enumerate(S):
+        if T in parent:
+            break
+        if s == 0 or s > T:
+            continue
+        feed = order[:bisect_right(order, T - s)]
+        new = []
+        for start in range(0, len(feed), per):
+            chunk = feed[start:start + per]
+            L = len(chunk)
+            src = [i % L for i in range(n)] if redundant else list(range(L)) + [None] * (n - L)
+            x = [chunk[k] if k is not None else 0 for k in src]
+            y = [s if k is not None else 0 for k in src]
+            labels = [(f'{chunk[k]}+{s}' + (' ↻' if i >= L else '')) if k is not None else ''
+                      for i, k in enumerate(src)]
+            act = [k is not None for k in src]
+            gen = optical_add(bench, x, y, W, act, (n - L) if redundant else 0)
+            while True:
+                try:
+                    e = next(gen)
+                except StopIteration as stop:
+                    res = stop.value
+                    break
+                e['stage'] = (f'element {j + 1}/{len(S)} (s={s}), '
+                              f'lanes {start + 1}-{start + L} of {len(feed)}, {n // L if redundant else 1} cop.')
+                e['labels'] = labels
+                yield e
+            for i, r in enumerate(chunk):
+                vals = [res[q] for q in range(i, n, L)] if redundant else [res[i]]
+                if len(vals) > 1:
+                    top, cnt = Counter(vals).most_common(1)[0]
+                    if 2 * cnt <= len(vals):
+                        raise RuntimeError(f'Replica disagreement for {r}+{s}: {vals}')
+                    if cnt < len(vals):
+                        bench.corrected += 1
+                    v = top
+                else:
+                    v = vals[0]
+                if v != r + s:
+                    raise RuntimeError(f'Optical/CPU mismatch: {r}+{s} decoded as {v}')
+                if v not in parent:
+                    parent[v] = j
+                    new.append(v)
+            if T in parent:
+                break
+        if new:
+            order = sorted(order + new)
+        report(f'Element {j + 1}/{len(S)} s={s}: {len(feed)} lanes, {len(new)} new sums, {len(parent)} reachable')
+    if T not in parent:
+        return None
+    idx, v = [], T
+    while v:
+        k = parent[v]
+        idx.append(k)
+        v -= S[k]
+    idx.sort()
+    if sum(S[k] for k in idx) != T:
+        raise RuntimeError('Reconstruction check failed.')
+    return idx
 
-    ngrams = {L: {tuple(n.tokens[i:i + L]) for n in sentences for i in range(len(n.tokens) - L + 1)}
-              for L in range(2, 9)}
-    node, node_idx, pass_no, produced = sentences.head, 0, 0, 0
-    while produced < token_count:
-        nxt = node.next or (sentences.head if sentences.size > 1 else None)
-        module = node.instruction
-        io = ModuleInput(history=tuple(output), node=node, nxt=nxt,
-                         upstream=dict(blackboard), all_vocab=all_vocab, ngrams=ngrams)
-        res = run_module(module, model, fragments, io, rng,
-                         budget=token_count - produced, step0=produced,
-                         total_steps=token_count, beam_size=beam_size, tau=tau,
-                         temperature=temperature, show_trace=show_trace)
-        res = dataclasses.replace(res, node_idx=node_idx, pass_no=pass_no)
-        res.markovlet.name = f"{res.provides}#{pass_no}.{node_idx}"
-        res.markovlet.sources = [res.markovlet.name]
 
-        output.extend(res.tokens)
-        entries.append((res.module, f"[{res.module}] {res.text}" if labels else res.text))
-        blackboard[res.provides] = res
-        results.append(res)
-        produced += len(res.tokens)
-
-        if node.next is None:
-            node, node_idx, pass_no = sentences.head, 0, pass_no + 1
-        else:
-            node, node_idx = node.next, node_idx + 1
-
-    if layout != "lines":
-        return detokenize(output)
-    if arrange == "sequence":                        # chronological: one line per module run
-        return "\n".join([prompt_line] + [line for _, line in entries])
-
-    # grouped: every module's lines together, groups in module order
-    groups: Dict[str, List[str]] = {}
-    for name, line in entries:                       # dict keeps first-appearance (= module) order
-        groups.setdefault(name, []).append(line)
-    out = [prompt_line]
-    for name, group_lines in groups.items():
-        out.append("")
-        out.append(f"== {name} x{len(group_lines)} ==")
-        out.extend(group_lines)
-    return "\n".join(out)
+def parse_set(text):
+    try:
+        S = [int(v) for v in text.replace(';', ',').replace(' ', ',').split(',') if v.strip()]
+    except ValueError:
+        raise ValueError('Set S must be comma-separated integers, e.g. 3,5,7,11.')
+    if not 1 <= len(S) <= MAX_SUBSET_ELEMENTS:
+        raise ValueError(f'Set S needs 1..{MAX_SUBSET_ELEMENTS} elements.')
+    if any(v < 0 for v in S):
+        raise ValueError('Set S elements must be >= 0.')
+    return S
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="N-gram text generator with non-isomorphic adiabatic fragment scoring.")
-    parser.add_argument("corpus", nargs="?", help="UTF-8 text corpus file; uses a small built-in corpus if omitted.")
-    parser.add_argument("--prompt", default="A process", help="Initial text context.")
-    parser.add_argument("--tokens", type=int, default=1800, help="Maximum number of new tokens.")
-    parser.add_argument("--order", type=int, default=2, help="N-gram order (default: 3).")
-    parser.add_argument("--alpha", type=float, default=0.25, help="Additive smoothing value.")
-    parser.add_argument("--beam", type=int, default=18, help="Number of candidate next words retained before sampling.")
-    parser.add_argument("--tau", type=float, default=0.95, help="Maximum allowed fragment consistency score (0..1).")
-    parser.add_argument("--temperature", type=float, default=.85, help="Sampling temperature; near zero selects the top candidate.")
-    parser.add_argument("--seed", type=int, default=7, help="Random seed for repeatable generation.")
-    parser.add_argument("--trace", action="store_true", help="Print per-token scoring diagnostics.")
-    parser.add_argument("--save", help="Optional output text file.")
-    parser.add_argument("--dataset-modules", default="modules.json", help="JSON file of learned phrases; created from the corpus if missing.")
-    parser.add_argument("--no-dataset-substitution", action="store_true", help="Disable automatic replacement after is/are/was/were.")
-    parser.add_argument("--inline", action="store_true",
-                        help="Join all module segments into one paragraph instead of one line each.")
-    parser.add_argument("--labels", action="store_true",
-                        help="Prefix each line with the module that produced it, e.g. [OBSERVE].")
-    parser.add_argument("--modules", default=",".join(m.name for m in INSTRUCTIONS),
-                        help="Comma-separated module order, e.g. OBSERVE,DESCRIBE,RELATE.")
-    parser.add_argument("--arrange", choices=["grouped", "sequence"], default="grouped",
-                        help="grouped (default): all OBSERVE lines, then all DESCRIBE lines, ... in module "
-                             "order; sequence: lines in the order the modules actually ran.")
-    parser.add_argument("--assign", choices=["cycle", "blocks"], default="cycle",
-                        help="How modules are spread over the sorted list: cycle (every module "
-                             "appears, default) or blocks (one contiguous block per module).")
-    parser.add_argument("--results-json", help="Write every ModuleResult and its markovlet to this JSON file.")
-    args = parser.parse_args()
+class App(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title('Variable-cell IR bench + 20 mm mask PNG')
+        self.geometry('1300x880')
+        self.vars = {k: tk.StringVar(value=str(v)) for k, v in dict(
+            cells=DEFAULT_CELLS, N=143, x=11, y=13, S='3,5,7,11', T=15, count=32, copies=1,
+            exposure=.22, leak=.001, noise=.002, seed=1, delay=5,
+            ambient=.04, ito_er=20, ito_loss=8, ito_rej=15, ito_tau=50, ito_settle=250).items()}
 
-    if args.corpus:
-        corpus_path = Path(args.corpus)
-        if not corpus_path.is_file():
-            parser.error(f"Corpus file not found: {corpus_path}")
+        self.vars['cells'].trace_add('write', self.on_cells_changed)
+
+        self.A, self.B = tk.BooleanVar(value=True), tk.BooleanVar(value=True)
+        self.ITO = tk.BooleanVar(value=True)
+        self.REPL = tk.BooleanVar(value=True)
+        self.status = tk.StringVar(value='Set Cells, then run. Mask and arithmetic use the same count.')
+        self.job = None
+        self.last_camera = None
+        self.display_cells = DEFAULT_CELLS
+        self.cell_labels = []
+        self.mask_window = None
+        self.log_lines = deque(maxlen=250)
+
+        top = ttk.Frame(self, padding=8)
+        top.pack(fill='x')
+        self.entries = []
+        labels = [('cells', 'Cells (1–1024)'), ('N', 'Factor N'), ('x', 'Adder X'), ('y', 'Adder Y'),
+                  ('S', 'Subset set S'), ('T', 'Target T'), ('count', 'Count (1–32)'), ('copies', 'Copies (1–9)'), ('exposure', 'Exposure'), ('leak', 'Leak'),
+                  ('noise', 'Noise σ'), ('seed', 'Seed'), ('delay', 'Delay ms')]
+        for j, (key, label) in enumerate(labels):
+            ttk.Label(top, text=label).grid(row=0, column=j, padx=3)
+            if key == 'cells':
+                entry = ttk.Spinbox(top, from_=1, to=MAX_CELLS, textvariable=self.vars[key], width=10,
+                                    command=self.on_spinbox_changed)
+                entry.bind('<KeyRelease>', self.on_cells_key_release)
+            else:
+                entry = ttk.Entry(top, textvariable=self.vars[key], width=16 if key == 'S' else 10)
+            entry.grid(row=1, column=j, padx=3)
+            self.entries.append(entry)
+
+        ito_bar = ttk.Frame(self, padding=(8, 0))
+        ito_bar.pack(fill='x')
+        ttk.Checkbutton(ito_bar, text='ITO IR-blocking plate (simulated, next run)', variable=self.ITO).grid(row=1, column=0, padx=3)
+        for j, (key, label) in enumerate([('ambient', 'Ambient IR'), ('ito_er', 'Block ER dB'), ('ito_loss', 'Open loss %'),
+                                          ('ito_rej', 'Ambient reject dB'), ('ito_tau', 'Plate τ µs'),
+                                          ('ito_settle', 'Settle µs')], start=1):
+            ttk.Label(ito_bar, text=label).grid(row=0, column=j, padx=3)
+            entry = ttk.Entry(ito_bar, textvariable=self.vars[key], width=10)
+            entry.grid(row=1, column=j, padx=3)
+            self.entries.append(entry)
+        ttk.Checkbutton(ito_bar, text='Spare cells = vote replicas (off: plate-blocked)', variable=self.REPL).grid(row=1, column=7, padx=8)
+
+        bar = ttk.Frame(self, padding=8)
+        bar.pack(fill='x')
+        self.buttons = []
+        for label, command in [('Full-adder test', lambda: self.start('truth')),
+                               ('Optical X + Y', lambda: self.start('add')),
+                               ('Factor N (hybrid)', lambda: self.start('factor')),
+                               ('Populate random S', self.populate),
+                               ('Subset sum (min cells)', lambda: self.start('subset')),
+                               ('ITO A/B test', self.ito_ab),
+                               ('Export/show mask PNG', self.show_mask)]:
+            b = ttk.Button(bar, text=label, command=command)
+            b.pack(side='left', padx=4)
+            self.buttons.append(b)
+        ttk.Button(bar, text='Stop', command=self.stop).pack(side='left', padx=4)
+        ttk.Checkbutton(bar, text='LED A (next run)', variable=self.A).pack(side='left', padx=5)
+        ttk.Checkbutton(bar, text='LED B (next run)', variable=self.B).pack(side='left')
+        ttk.Label(self, textvariable=self.status, padding=8, wraplength=1250).pack(fill='x')
+
+        frame = ttk.Frame(self)
+        frame.pack(fill='both', expand=True, padx=8)
+        self.canvas = tk.Canvas(frame, bg='#101827', highlightthickness=0)
+        scroll = ttk.Scrollbar(frame, orient='vertical', command=self.canvas.yview)
+        self.canvas.configure(yscrollcommand=scroll.set)
+        scroll.pack(side='right', fill='y')
+        self.canvas.pack(side='left', fill='both', expand=True)
+        self.canvas.bind('<Configure>', lambda e: self.draw())
+
+        self.log = tk.Text(self, height=8, wrap='word', font=('TkFixedFont', 10))
+        self.log.pack(fill='x', padx=8, pady=8)
+        ttk.Label(self, text='Fixed mask + programmable shutters + camera intensity readout. CPU supplies decoding, carry feedback, trial search and final comparison.\n'
+                             '20 × 20 mm mask is invariant across problems; aperture size adapts to cell count. Subset sum: lanes = distinct reachable sums ≤ T on the minimum cell count. No all-optical solving claim.',
+                  padding=8).pack(fill='x')
+        self.say('Fewer than 8 cells: truth test uses multiple exposures. More than 8: unused test lanes receive zero inputs.')
+        self.say('Subset sum auto-sets Cells to the minimum needed (peak distinct reachable sums, capped at MAX_CELLS).')
+        self.draw()
+
+    def on_spinbox_changed(self):
+        self.on_cells_changed()
+
+    def on_cells_key_release(self, event):
+        self.on_cells_changed()
+
+    def on_cells_changed(self, *args):
         try:
-            corpus_text = corpus_path.read_text(encoding="utf-8-sig")
-        except UnicodeDecodeError as exc:
-            parser.error(f"Could not decode corpus as UTF-8: {exc}")
-    else:
-        corpus_text = BUILTIN_CORPUS
+            n = self.cell_count()
+            if 1 <= n <= MAX_CELLS:
+                self.display_cells = n
+                self.last_camera = None
+                self.cell_labels = []
 
-    dataset_modules = [] if args.no_dataset_substitution else load_dataset_modules(corpus_text, args.dataset_modules)
-    if dataset_modules:
-        print(f"[dataset modules] {len(dataset_modules)} phrases available for automatic substitution")
+                wa = max(2, (n + 1) // 2)
+                wb = max(2, n - 1)
+                W = wa + wb
+                self.status.set(f'Cells updated to {n} | Dynamic Bit Widths: wa={wa}, wb={wb}, total W={W}')
 
-    names = [n.strip().upper() for n in args.modules.split(",") if n.strip()]
-    unknown = [n for n in names if n not in MODULES]
-    if unknown or not names:
-        parser.error(f"Unknown module(s) {unknown}; choose from {sorted(MODULES)}")
-    order = [MODULES[n] for n in names]
-    for warning in check_dependencies(order):
-        print(f"[warn] {warning} (module will run without it)")
+                self.draw()
+                if self.mask_window is not None and self.mask_window.winfo_exists():
+                    self.show_mask(n)
+        except ValueError:
+            pass
 
-    # Sorted linked list of sentences, each linked to a module
-    sentence_list = build_sentence_list(corpus_text, alpha_mix=0.3, order=order, assign=args.assign)
-    corpus_text = flatten_sentence_list(sentence_list)
-    if args.trace:
-        print("--- SORTED SENTENCE LIST ---")
-        for i, n in enumerate(sentence_list):
-            print(f"{i}: [{n.instruction.name:<10}] score={n.score:.3f}  {n.text[:60]}")
-        print()
+    def populate(self):
+        try:
+            k = int(self.vars['count'].get())
+            if not 1 <= k <= MAX_SUBSET_ELEMENTS:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror('Populate', f'Count must be an integer 1..{MAX_SUBSET_ELEMENTS}.')
+            return
+        rng = random.Random()
+        S = [rng.randint(1, RANDOM_MAX) for _ in range(k)]
+        pick = [v for v in S if rng.random() < .5] or [S[0]]  # guarantees a solvable T
+        T = sum(pick)
+        self.vars['S'].set(','.join(map(str, S)))
+        self.vars['T'].set(str(T))
+        shown = S if k <= 12 else f'{S[:8]}… ({k} numbers)'
+        note = f'Populated S={shown}, T={T} (sum of a random subset, so a solution exists).'
+        try:
+            try:
+                copies = max(1, min(9, int(self.vars['copies'].get())))
+            except ValueError:
+                copies = 1
+            plan = plan_subset(S, T, copies)
+            self.vars['cells'].set(str(plan['n']))  # minimum cells; keeps mask preview in sync
+            note += f' Minimum cells: {plan["n"]} (peak {plan["peak"]} lanes), ~{plan["exposures"]:,} exposures.'
+            if plan['exposures'] > MAX_EXPOSURES:
+                note += f' Too large to run (limit {MAX_EXPOSURES:,}): lower Count or RANDOM_MAX.'
+        except ValueError as e:
+            note += f' {e}'
+        self.say(note)
 
-    if not tokenize(corpus_text):
-        parser.error("Corpus contains no recognizable tokens.")
+    def ito_ab(self):
+        if self.job is not None:
+            return
+        try:
+            self.params('add')  # validates fields and fills base_kw / plate_kw
+        except ValueError as e:
+            messagebox.showerror('Input', str(e))
+            return
+        res = ito_ab_test(self.base_kw, self.plate_kw)
+        for label, r in res.items():
+            self.say(f'ITO A/B {label}: {r["aborted"]} aborted, {r["wrong"]} wrong decodes, '
+                     f'worst margin {r["worst"]:.2f}, rms level error {r["rms"]:.3f}, plate time {r["plate_ms"]:.0f} ms')
+        w, p = res['without plate'], res['with plate']
+        self.status.set(f'ITO A/B (64 lanes, 2000 exposures, 25% idle): rms error {w["rms"]:.3f} → {p["rms"]:.3f}; '
+                        f'aborted {w["aborted"]} → {p["aborted"]}; wrong {w["wrong"]} → {p["wrong"]}')
 
-    model = NGramModel(order=args.order, alpha=args.alpha)
-    model.train(corpus_text)
+    def say(self, s):
+        self.log_lines.append(s)
+        self.log.configure(state='normal')
+        self.log.delete('1.0', 'end')
+        self.log.insert('end', '\n'.join(self.log_lines))
+        self.log.see('end')
+        self.log.configure(state='disabled')
 
-    exec_log: List[ModuleResult] = []
-    result = generate(
-        model=model,
-        prompt=args.prompt,
-        token_count=args.tokens,
-        beam_size=args.beam,
-        tau=float(np.clip(args.tau, 0.0, 1.0)),
-        temperature=max(0.0, args.temperature),
-        seed=args.seed,
-        show_trace=args.trace,
-        sentences=sentence_list,
-        results=exec_log,
-        layout="inline" if args.inline else "lines",
-        labels=args.labels,
-        arrange=args.arrange,
-    )
+    def cell_count(self):
+        val = self.vars['cells'].get().strip()
+        n = int(val) if val.isdigit() else DEFAULT_CELLS
+        if not 1 <= n <= MAX_CELLS:
+            raise ValueError(f'Cells must be 1..{MAX_CELLS}.')
+        return n
 
-    if not args.no_dataset_substitution and dataset_modules:
-        result = substitute_dataset_modules(result, args.prompt, dataset_modules)
+    def params(self, mode):
+        n = self.cell_count()
+        N = x = y = 0
+        S, T = [], 0
+        if mode == 'subset':
+            S = parse_set(self.vars['S'].get())
+            T = int(self.vars['T'].get())
+            if T < 0:
+                raise ValueError('Target T must be >= 0.')
+            copies = int(self.vars['copies'].get())
+            if not 1 <= copies <= 9:
+                raise ValueError('Copies must be 1..9.')
+            self.copies = copies
+            self.plan = plan_subset(S, T, copies)
+            if self.plan['exposures'] > MAX_EXPOSURES:
+                raise ValueError(f'Needs ~{self.plan["exposures"]:,} exposures (limit {MAX_EXPOSURES:,}). '
+                                 'Lower Count/random max or use a smaller target.')
+            n = self.plan['n']  # minimum cells
+        else:
+            N, x, y = [int(self.vars[k].get()) for k in ('N', 'x', 'y')]
+            if not 4 <= N or not 0 <= x or not 0 <= y:
+                raise ValueError('N must be >= 4; X/Y must be >= 0.')
+        p, l, z = [float(self.vars[k].get()) for k in ('exposure', 'leak', 'noise')]
+        if not all(math.isfinite(v) for v in (p, l, z)) or not (0 <= p <= 1 and 0 <= l < .5 and 0 <= z <= 1):
+            raise ValueError('Exposure 0–1, leak 0–<0.5, noise 0–1.')
+        delay = int(self.vars['delay'].get())
+        if not 0 <= delay <= 1000:
+            raise ValueError('Delay: 0–1000 ms.')
+        amb, er, loss, rej, tau, settle = [float(self.vars[k].get()) for k in
+                                           ('ambient', 'ito_er', 'ito_loss', 'ito_rej', 'ito_tau', 'ito_settle')]
+        if not all(math.isfinite(v) for v in (amb, er, loss, rej, tau, settle)):
+            raise ValueError('ITO/ambient values must be finite numbers.')
+        if not (0 <= amb <= .5 and 0 <= er <= 60 and 0 <= loss <= 50 and 0 <= rej <= 60 and tau >= 0 and settle >= 0):
+            raise ValueError('Ambient 0–0.5, ER 0–60 dB, loss 0–50 %, reject 0–60 dB, τ/settle ≥ 0.')
+        self.plate_kw = dict(extinction_db=er, loss=loss / 100, reject_db=rej, tau_us=tau, settle_us=settle)
+        self.base_kw = dict(exposure=p, leak=l, noise=z, seed=int(self.vars['seed'].get()),
+                            led_a=self.A.get(), led_b=self.B.get(), ambient=amb)
+        bench = CameraBench(n, ito=ITOPlate(self.ITO.get(), **self.plate_kw), **self.base_kw)
+        return N, x, y, S, T, delay, bench
 
-    print("\n--- GENERATED TEXT ---\n")
-    print(result)
+    def start(self, mode):
+        if self.job is not None:
+            return
+        try:
+            self.N, self.x, self.y, self.S, self.T, self.delay, self.bench = self.params(mode)
+        except ValueError as e:
+            messagebox.showerror('Input', str(e))
+            return
+        self.mode = mode
+        self.display_cells = self.bench.cells
+        pl = self.bench.ito
+        if pl.enabled:
+            self.say(f'ITO plate on: block {pl.extinction_db:.0f} dB, open loss {pl.loss * 100:.0f}%, ambient reject {pl.reject_db:.0f} dB, '
+                     f'tau {pl.tau_us:.0f} us, settle {pl.settle_us:.0f} us (only waited when apertures switch)')
+        self.last_camera = None
+        self.cell_labels = []
 
-    coverage = Counter(r.module for r in exec_log)
-    print("\n--- MODULE COVERAGE ---")
-    print("  ".join(f"{m.name}x{coverage.get(m.name, 0)}" for m in order))
-    idle = [m.name for m in order if coverage.get(m.name, 0) == 0]
-    if idle:
-        print(f"[note] never ran: {', '.join(idle)} (raise --tokens, or use --assign cycle)")
+        if mode == 'subset':
+            # Sync the Cells box (and open mask window) to the minimum cell count.
+            if self.vars['cells'].get().strip() != str(self.bench.cells):
+                self.vars['cells'].set(str(self.bench.cells))
+            self.display_cells = self.bench.cells
+            self.last_camera = None
+            self.cell_labels = []
+            self.say(f'Plan: {self.plan["n"]} cells (peak {self.plan["peak"]} lanes), '
+                     f'W={self.plan["W"]}, ~{self.plan["exposures"]:,} exposures max.')
 
-    if args.trace:
-        print("\n--- MARKOVLETS BUILT ---")
-        for r in exec_log:
-            st = r.markovlet.stats()
-            print(f"pass {r.pass_no} node {r.node_idx} {r.module:<10} -> {r.provides:<11} "
-                  f"walked={r.chain}\n    consumed={list(r.consumed)} missing={list(r.missing)} "
-                  f"natural={r.natural_rate:.0%} novelty={r.novelty:.0%} fallbacks={r.fallbacks} "
-                  f"learned(contexts={st['contexts']}, vocab={st['vocab']})\n    text={r.text}")
+        for e in self.entries + self.buttons:
+            e.configure(state='disabled')
 
-    if args.results_json:
-        Path(args.results_json).write_text(
-            json.dumps([result_to_dict(r) for r in exec_log], indent=2), encoding="utf-8")
-        print(f"[Saved {len(exec_log)} module results (with markovlets) to {args.results_json}]")
+        n = self.bench.cells
+        wa = max(2, (n + 1) // 2)
+        wb = max(2, n - 1)
+        W = wa + wb
 
-    if args.save:
-        Path(args.save).write_text(result, encoding="utf-8")
-        print(f"\n[Saved output to {args.save}]")
+        if mode == 'factor':
+            self.job = factor_job(self.bench, self.N, self.say)
+        elif mode == 'add':
+            self.job = optical_add(self.bench, [self.x] * n, [self.y] * n, max(W, self.N.bit_length(), (self.x + self.y).bit_length() + 1))
+        elif mode == 'subset':
+            self.job = subset_sum_job(self.bench, self.S, self.T, self.say, self.copies, self.REPL.get())
+        else:
+            self.job = truth_job(self.bench, self.say)
+        self.after(1, self.tick)
+
+    def tick(self):
+        if self.job is None:
+            return
+        try:
+            e = next(self.job)
+            self.last_camera = self.bench.last
+            if 'labels' in e:
+                self.cell_labels = e['labels']
+            stage = f' | {e["stage"]}' if 'stage' in e else ''
+            self.status.set(f'{self.mode}: {self.bench.cells} cells | exposure {self.bench.exposures} | bit {e["bit"] + 1}/{e["width"]} | margin {self.bench.worst_margin:.2f}{stage}')
+            self.draw()
+            self.after(self.delay, self.tick)
+        except StopIteration as e:
+            r = e.value
+            if self.mode == 'factor':
+                msg = f'Camera-derived candidate: {self.N} = {r[0]} × {r[1]}' if r else 'No divisor detected; a noisy search is not a primality certificate.'
+            elif self.mode == 'add':
+                top, cnt = Counter(r).most_common(1)[0]  # every cell computes X+Y; majority vote
+                msg = f'Camera-derived sum: {self.x} + {self.y} → {top}; {cnt}/{len(r)} lanes agree'
+            elif self.mode == 'subset':
+                if r is not None:
+                    vals = [self.S[k] for k in r]
+                    shown = vals if len(vals) <= 12 else f'{vals[:12]}… ({len(vals)} elements)'
+                    msg = f'Subset sum: {shown} totals {self.T} (one solution; indices {r[:12]}{"…" if len(r) > 12 else ""})'
+                else:
+                    msg = f'Subset sum: no subset totals {self.T}'
+            else:
+                msg = r
+            self.status.set(msg + f' | {self.bench.exposures} exposures')
+            self.say(self.status.get())
+            self.say(f'Decode: worst margin {self.bench.worst_margin:.2f}, rms level error {self.bench.rms_error:.3f}; '
+                     f'ITO {"on" if self.bench.ito.enabled else "off"}, plate settle time {self.bench.plate_time_us / 1000:.1f} ms')
+            bn = self.bench
+            tot = bn.slots_useful + bn.slots_replica + bn.slots_idle
+            if tot:
+                self.say(f'Cell use: {100 * bn.slots_useful / tot:.0f}% useful, {100 * bn.slots_replica / tot:.0f}% vote replicas '
+                         f'({bn.corrected} lanes corrected), {100 * bn.slots_idle / tot:.0f}% idle '
+                         f'({"plate-blocked" if bn.ito.enabled else "lit but unused"})')
+            self.finish()
+            self.show_mask(self.bench.cells)
+        except Exception as e:
+            self.status.set('Stopped: ' + str(e))
+            self.say(self.status.get())
+            self.finish()
+
+    def finish(self):
+        self.job = None
+        for e in self.entries + self.buttons:
+            e.configure(state='normal')
+
+    def stop(self):
+        if self.job is not None:
+            self.job.close()
+            self.finish()
+            self.status.set('Stopped. No completed-run export.')
+
+    def show_mask(self, cells=None):
+        try:
+            n = self.cell_count() if not isinstance(cells, int) else cells
+            path, image, meta = export_mask(Path(__file__).resolve().parent / 'mask', n)
+            self.say(f'Mask: {n} cells, diameter {meta["diameter"]:.3f} mm | {path}')
+            if self.mask_window is not None and self.mask_window.winfo_exists():
+                self.mask_window.destroy()
+            win = tk.Toplevel(self)
+            self.mask_window = win
+            win.title('20 × 20 mm physical mask PNG')
+            preview = image.convert('RGB').resize((600, 600), Image.Resampling.NEAREST if hasattr(Image, 'Resampling') else Image.NEAREST)
+            photo = ImageTk.PhotoImage(preview)
+            label = ttk.Label(win, image=photo)
+            label.image = photo
+            label.pack(padx=8, pady=8)
+            ttk.Label(win, text=f'{n} cells | {meta["cols"]} columns × {meta["rows"]} rows | aperture {meta["diameter"]:.3f} mm\n20 × 20 mm at 2540 DPI. White=open. Print actual size.', padding=8).pack()
+        except Exception as e:
+            messagebox.showerror('Mask export', str(e))
+
+    def draw(self):
+        cv = self.canvas
+        cv.delete('all')
+        w = max(450, cv.winfo_width())
+        n = self.display_cells
+        cols = min(n, max(1, int(w / 260)))
+        rows = math.ceil(n / cols)
+        cw, ch = (w - 24) / cols, 210
+        cv.configure(scrollregion=(0, 0, w, rows * ch + 40))
+        for i in range(n):
+            x, y = 12 + (i % cols) * cw, 12 + (i // cols) * ch
+            cv.create_rectangle(x, y, x + cw - 10, y + ch - 10, fill='#182338', outline='#475569')
+            title = f'Cell {i + 1}'
+            if i < len(self.cell_labels) and self.cell_labels[i]:
+                title += f'  {self.cell_labels[i]}'
+            cv.create_text(x + 12, y + 18, text=title, fill='white', anchor='w')
+            data = self.last_camera
+            inp = data['inputs'][i] if data and i < len(data['inputs']) else (0, 0, 0)
+            for j, label in enumerate(('a / A', 'b / A', 'carry / B')):
+                xx = x + 20 + j * (cw - 50) / 3
+                cv.create_oval(xx, y + 36, xx + 18, y + 54, fill='#fbbf24' if inp[j] else '#080d19', outline='#94a3b8')
+                cv.create_text(xx, y + 68, text=label, fill='#94a3b8', anchor='w', font=('TkDefaultFont', 9))
+            if data and i < len(data['rows']):
+                r, d = data['rows'][i], data['decoded'][i]
+                for j, (label, key) in enumerate((('signal', 'signal'), ('ref A', 'refa'), ('ref B', 'refb'))):
+                    yy = y + 94 + j * 23
+                    cv.create_text(x + 12, yy, text=label, fill='#94a3b8', anchor='w')
+                    left, right = x + 70, x + cw - 58
+                    cv.create_rectangle(left, yy - 5, right, yy + 5, fill='#080d19', outline='')
+                    cv.create_rectangle(left, yy - 5, left + (right - left) * r[key], yy + 5, fill='#34d399', outline='')
+                    cv.create_text(right + 4, yy, text=f'{r[key]:.2f}', fill='white', anchor='w', font=('TkDefaultFont', 9))
+                cv.create_text(x + 12, y + 179, text=f'Level {d["level"]:.2f} → sum {d["sum"]} carry {d["carry"]}', fill='#67e8f9', anchor='w', font=('TkDefaultFont', 10))
+            else:
+                cv.create_text(x + 12, y + 110, text='Ready for exposure', fill='#94a3b8', anchor='w')
 
 
-if __name__ == "__main__":
-    main()
+if __name__ == '__main__':
+    App().mainloop()
