@@ -24,6 +24,8 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import ast
+import csv
 import json
 import math
 import random
@@ -685,6 +687,162 @@ def build_corpus_ngrams(
     return ngrams
 
 
+
+def _identity_ast(node: ast.AST, parameter_map: Optional[Dict[str, str]] = None) -> str:
+    """Canonicalize an expression for conservative functional-identity matching.
+
+    Parameter names are alpha-renamed (x/y -> ARG0/ARG1). Commutative operands
+    of +, *, &, |, ==, and != are sorted, so x+y and y+x share a fingerprint.
+    This is a syntactic identity heuristic, not a theorem prover.
+    """
+    parameter_map = parameter_map or {}
+    if isinstance(node, ast.Name):
+        return parameter_map.get(node.id, f"NAME:{node.id}")
+    if isinstance(node, ast.Constant):
+        return f"CONST:{type(node.value).__name__}:{node.value!r}"
+    if isinstance(node, ast.Attribute):
+        return f"ATTR({_identity_ast(node.value, parameter_map)}.{node.attr})"
+    if isinstance(node, ast.Call):
+        fn = _identity_ast(node.func, parameter_map)
+        args = [_identity_ast(arg, parameter_map) for arg in node.args]
+        kwargs = sorted((kw.arg or "**", _identity_ast(kw.value, parameter_map)) for kw in node.keywords)
+        return f"CALL({fn};{','.join(args)};{kwargs!r})"
+    if isinstance(node, ast.BinOp):
+        left = _identity_ast(node.left, parameter_map)
+        right = _identity_ast(node.right, parameter_map)
+        op = type(node.op).__name__
+        if op in {"Add", "Mult", "BitAnd", "BitOr"}:
+            left, right = sorted((left, right))
+        return f"BIN:{op}({left},{right})"
+    if isinstance(node, ast.BoolOp):
+        op = type(node.op).__name__
+        values = [_identity_ast(v, parameter_map) for v in node.values]
+        if op in {"And", "Or"}:
+            values.sort()
+        return f"BOOL:{op}({','.join(values)})"
+    if isinstance(node, ast.Compare):
+        return f"CMP({_identity_ast(node.left, parameter_map)};{','.join(type(op).__name__ for op in node.ops)};{','.join(_identity_ast(v, parameter_map) for v in node.comparators)})"
+    if isinstance(node, ast.UnaryOp):
+        return f"UNARY:{type(node.op).__name__}({_identity_ast(node.operand, parameter_map)})"
+    if isinstance(node, ast.IfExp):
+        return f"IF({_identity_ast(node.test, parameter_map)}?{_identity_ast(node.body, parameter_map)}:{_identity_ast(node.orelse, parameter_map)})"
+    if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
+        return f"{type(node).__name__}({','.join(_identity_ast(v, parameter_map) for v in node.elts)})"
+    if isinstance(node, ast.Subscript):
+        return f"SUB({_identity_ast(node.value, parameter_map)}[{_identity_ast(node.slice, parameter_map)}])"
+    if isinstance(node, ast.Slice):
+        return f"SLICE({_identity_ast(node.lower, parameter_map) if node.lower else '_'}:{_identity_ast(node.upper, parameter_map) if node.upper else '_'}:{_identity_ast(node.step, parameter_map) if node.step else '_'})"
+    # Fallback retains the node type and recursively represented children.
+    return f"{type(node).__name__}({','.join(_identity_ast(c, parameter_map) for c in ast.iter_child_nodes(node))})"
+
+
+def _return_identity_features(fn: ast.AST) -> List[str]:
+    """Extract canonical return-expression identities from a function."""
+    args = getattr(fn, "args", None)
+    arg_names: List[str] = []
+    if args is not None:
+        arg_names = [a.arg for a in list(args.posonlyargs) + list(args.args) + list(args.kwonlyargs)]
+        if args.vararg:
+            arg_names.append(args.vararg.arg)
+        if args.kwarg:
+            arg_names.append(args.kwarg.arg)
+    parameter_map = {name: f"ARG{i}" for i, name in enumerate(arg_names)}
+    identities: List[str] = []
+    stack = list(reversed(getattr(fn, "body", [])))
+    while stack:
+        node = stack.pop()
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            continue
+        if isinstance(node, ast.Return) and node.value is not None:
+            identities.append(_identity_ast(node.value, parameter_map))
+        # Do not walk into nested function definitions.
+        stack.extend(reversed(list(ast.iter_child_nodes(node))))
+    return identities
+
+
+def function_inner_product_matrix(source_path: Optional[Path] = None) -> Tuple[List[str], np.ndarray]:
+    """Build an identity-aware Gram matrix for every function/method in source.
+
+    Each function vector combines AST structure, normalized function-call names,
+    and canonical return-expression identities. The identity component recognizes
+    limited forms such as ``x + y`` versus ``y + x`` and parameter renaming.
+    G = X @ X.T is an inner-product matrix. It measures shared features and
+    recognized syntactic identities; it does not prove arbitrary functions equal.
+    """
+    path = source_path or Path(__file__)
+    source = path.read_text(encoding="utf-8")
+    tree = ast.parse(source, filename=str(path))
+    definitions: List[Tuple[str, ast.AST]] = []
+
+    def visit(node: ast.AST, prefix: str = "") -> None:
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                qualified = f"{prefix}.{child.name}" if prefix else child.name
+                definitions.append((qualified, child))
+                visit(child, qualified)
+            elif isinstance(child, ast.ClassDef):
+                qualified = f"{prefix}.{child.name}" if prefix else child.name
+                visit(child, qualified)
+            else:
+                visit(child, prefix)
+
+    visit(tree)
+    if not definitions:
+        return [], np.zeros((0, 0), dtype=float)
+
+    feature_sets: List[Dict[str, float]] = []
+    for _, fn in definitions:
+        features: Dict[str, float] = {}
+        for node in _function_nodes_without_nested(fn):
+            key = f"AST:{type(node).__name__}"
+            features[key] = features.get(key, 0.0) + 1.0
+            if isinstance(node, ast.Call):
+                if isinstance(node.func, ast.Name):
+                    call_name = node.func.id
+                elif isinstance(node.func, ast.Attribute):
+                    call_name = node.func.attr
+                else:
+                    call_name = type(node.func).__name__
+                key = f"CALL:{call_name}"
+                features[key] = features.get(key, 0.0) + 1.0
+        for identity in _return_identity_features(fn):
+            key = f"IDENTITY:{identity}"
+            features[key] = features.get(key, 0.0) + 2.0
+        feature_sets.append(features)
+
+    vocabulary = sorted({key for features in feature_sets for key in features})
+    index = {key: i for i, key in enumerate(vocabulary)}
+    vectors = np.zeros((len(definitions), len(vocabulary)), dtype=float)
+    for row, features in enumerate(feature_sets):
+        for key, value in features.items():
+            vectors[row, index[key]] = value
+
+    return [name for name, _ in definitions], vectors @ vectors.T
+
+
+def _function_nodes_without_nested(function_node: ast.AST) -> List[ast.AST]:
+    """Return a function's AST nodes without counting nested function bodies."""
+    nodes: List[ast.AST] = []
+    stack = list(ast.iter_child_nodes(function_node))
+    while stack:
+        node = stack.pop()
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            continue
+        nodes.append(node)
+        stack.extend(ast.iter_child_nodes(node))
+    return nodes
+
+
+def save_function_inner_product_matrix(path: Path, names: Sequence[str], matrix: np.ndarray) -> None:
+    """Save the labelled function Gram matrix as CSV."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["function", *names])
+        for name, row in zip(names, matrix):
+            writer.writerow([name, *[f"{value:.6g}" for value in row]])
+
+
 def generate(
     model: NGramModel,
     prompt: str,
@@ -1094,7 +1252,7 @@ def main() -> None:
     )
     parser.add_argument("--prompt", default="A process")
     parser.add_argument("--tokens", type=int, default=500)
-    parser.add_argument("--order", type=int, default=3)
+    parser.add_argument("--order", type=int, default=5)
     parser.add_argument("--alpha", type=float, default=0.25)
     parser.add_argument("--beam", type=int, default=12)
     parser.add_argument("--tau", type=float, default=0.95)
@@ -1106,7 +1264,7 @@ def main() -> None:
         choices=TuringMachine.STATES,
     )
     parser.add_argument("--levels", type=int, default=5)
-    parser.add_argument("--ledger-weight", type=float, default=0.3)
+    parser.add_argument("--ledger-weight", type=float, default=0.9)
     parser.add_argument("--warm-limit", type=int, default=20000)
     parser.add_argument(
         "--keep-learning",
@@ -1126,6 +1284,17 @@ def main() -> None:
     )
     parser.add_argument("--save")
     parser.add_argument("--segments-json")
+    parser.add_argument(
+        "--function-matrix",
+        nargs="?",
+        const="function_inner_product.csv",
+        help="Write the inner-product (Gram) matrix of all functions/methods to CSV; optionally provide a path.",
+    )
+    parser.add_argument(
+        "--show-function-matrix",
+        action="store_true",
+        help="Print the labelled function inner-product matrix before generation.",
+    )
 
     args = parser.parse_args()
 
@@ -1151,6 +1320,24 @@ def main() -> None:
 
     model = NGramModel(order=args.order, alpha=args.alpha)
     model.train(corpus_text)
+
+    if args.function_matrix or args.show_function_matrix:
+        try:
+            function_names, gram_matrix = function_inner_product_matrix(Path(__file__))
+        except (OSError, SyntaxError) as exc:
+            parser.error(f"Could not construct function inner-product matrix: {exc}")
+
+        if args.function_matrix:
+            matrix_path = Path(args.function_matrix)
+            save_function_inner_product_matrix(matrix_path, function_names, gram_matrix)
+            print(f"[function-matrix] saved {len(function_names)} x {len(function_names)} matrix to {matrix_path}")
+
+        if args.show_function_matrix:
+            print("\n--- IDENTITY-AWARE FUNCTION INNER-PRODUCT MATRIX ---")
+            print("Functions:", " | ".join(function_names))
+            np.set_printoptions(precision=1, suppress=True, linewidth=180)
+            print(gram_matrix)
+
     while True:
         text, segments, ledger = generate(
             model,
