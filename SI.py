@@ -1115,7 +1115,7 @@ def main() -> None:
     while True:
         text, segments, ledger = generate(
             model,
-            args.prompt,
+            input("prompt> "),
             token_count=max(1, args.tokens),
             beam_size=max(1, args.beam),
             tau=args.tau,
