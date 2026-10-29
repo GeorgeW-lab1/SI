@@ -8,15 +8,6 @@ A corpus-based text generator controlled by an explicit Turing-style state
 machine. The generated token sequence is the machine's tape; named states
 control how the next token is proposed, filtered, scored, and accepted.
 
-States:
-  OBSERVE     continue local corpus-like flow
-  DESCRIBE    introduce new content while avoiding recent repetition
-  RELATE      bridge toward less-local vocabulary
-  ABSTRACT    prefer long, content-bearing vocabulary
-  SYNTHESIZE  blend local and broader corpus evidence
-  REFLECT     recall and consolidate the generated history
-  HALT        accepting state; ends the current segment
-
 The previous module pipeline has been removed. There are no Module,
 ModuleResult, blackboard, or dataset-phrase substitution components.
 
