@@ -634,6 +634,40 @@ def content_word(token: str) -> bool:
     return len(token) > 3 and token not in PUNCT
 
 
+def harmonization_score(
+    context: Sequence[str],
+    candidate: str,
+    strength: float = 0.75,
+) -> float:
+    """
+    Apply a small context-sensitive score adjustment to equation-like text.
+
+    If a recent context looks like an equation and contains the letter ``i``
+    without the digit ``1``, prefer ``1`` over ``i`` as the next token. This is
+    only a heuristic for token selection; it does not prove or solve algebra,
+    and it deliberately does not rewrite the existing tape.
+    """
+    recent = list(context[-16:])
+    if not recent:
+        return 0.0
+
+    equation_markers = {"=", "+", "-", "*", "/", "^", "(", ")"}
+    looks_like_equation = any(token in equation_markers for token in recent)
+    if not looks_like_equation:
+        return 0.0
+
+    has_i = any(token.lower() == "i" for token in recent)
+    has_one = "1" in recent
+    if not has_i or has_one:
+        return 0.0
+
+    if candidate == "1":
+        return float(strength)
+    if candidate.lower() == "i":
+        return -float(strength)
+    return 0.0
+
+
 def build_corpus_ngrams(
     sentences: Sequence[Sequence[str]],
 ) -> Dict[int, Set[Tuple[str, ...]]]:
@@ -912,6 +946,11 @@ def generate(
                     logp,
                     rank,
                     lam,
+                )
+                score += harmonization_score(
+                    tape,
+                    token,
+                    strength=0.75,
                 )
 
                 if (
