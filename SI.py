@@ -1361,12 +1361,10 @@ def main() -> None:
             )
             print(f"[Saved segments to {args.segments_json}]")
 
+   
     while True:
-  
-        prompt = input("prompt> ")
-        
-        run(prompt)
-  
+        run(args.prompt)
+
 
 if __name__ == "__main__":
     main()
