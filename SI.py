@@ -1362,12 +1362,9 @@ def main() -> None:
             print(f"[Saved segments to {args.segments_json}]")
 
     while True:
-        try:
-            prompt = input("prompt> ")
-        except EOFError:
-            break
-        if not prompt.strip():
-            break
+  
+        prompt = input("prompt> ")
+        
         run(prompt)
   
 
