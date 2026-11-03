@@ -14,11 +14,31 @@ The generate() function:
 
 5. Fills each <ASSOC> slot from the strongest corpus associates.
 6. Uses the filled template as the initial Turing-machine tape.
-7. Continues generation using explicit Turing states.
+7. Continues generation using explicit Turing states, one token at a time,
+   through the recursive I-II-III-O memory loop.
+
+The recursive memory loop (the "I-II-III-O Protocol")
+-----------------------------------------------------
+  I    Identity        recognise the current state: rank next-token candidates
+                       (the Turing state's hard constraints apply here)
+  II   Correspondence  signal between context and candidate (fragment score,
+                       ledger bonus, Turing-state bonuses)
+  III  Verification    continuity check  Delta(M_t, M_{t+1}) <= epsilon
+  O    Recycling       reintegrate the chosen token: write it to the tape,
+                       fold it into memory, advance the Turing machine
+
+      M_{t+1} = O(III(II(I(M_t))))        I_{t+1} = O_t
+
+M_t is a unit vector: the exponentially decayed sum of hashed token features
+of everything on the tape. Delta is half the Euclidean distance between
+consecutive unit states (0..1). Over-strict enforcement would classify
+ordinary variation as error, so epsilon is relaxed geometrically whenever no
+candidate passes, rather than rejecting everything.
 
 Usage:
   python discrete_lock_turing.py corpus.txt --prompt "once upon a" --tokens 200 --trace
-  python discrete_lock_turing.py --prompt "The machine" --tokens 120
+  python discrete_lock_turing.py --prompt "The machine" --tokens 120 --epsilon 0.4
+  python discrete_lock_turing.py --interactive
 """
 
 from __future__ import annotations
@@ -51,6 +71,7 @@ TOKEN_RE = re.compile(
 PUNCT = set(".,!?;:")
 END = {".", "!", "?"}
 SPECIAL = {"", "<s>", "</s>"}
+PROTOCOL_SYMBOLS = {"II", "III"}  # stage names of the I-II-III-O protocol
 
 BUILTIN_CORPUS = (
     "The process begins with a simple observation of local flows. "
@@ -142,6 +163,7 @@ class Candidate:
     consistency: float
     alignment: float
     probability: float = 0.0
+    delta: float = 0.0  # continuity deviation Delta(M_t, M_{t+1})
 
 
 class NGramModel:
@@ -158,9 +180,6 @@ class NGramModel:
 
     def train(self, text: str) -> None:
         tokens = [""] * (self.order - 1) + tokenize(text) + [""]
-
-        if not tokens:
-            return
 
         for i in range(self.order - 1, len(tokens)):
             target = tokens[i]
@@ -230,17 +249,25 @@ class TuringTransition:
     """
     One Turing-machine transition rule.
 
+    state:
+      The control state in which this rule is active. (Previously missing, so
+      every rule fired in every state and the machine never advanced.)
+
     read:
-      "*" matches any symbol class.
-      Other valid values are END, PUNCT, LONG, MEDIUM, SHORT, BLANK.
+      "*" matches any symbol class; otherwise END, PUNCT, LONG, MEDIUM,
+      SHORT or BLANK.
 
     write:
       A literal token to append, or None to append the sampled candidate.
 
     move:
       Head movement: -1, 0, or +1.
+
+    min_steps / max_steps:
+      Bounds on the number of steps already spent IN `state`.
     """
 
+    state: str
     read: str
     write: Optional[str]
     move: int
@@ -264,57 +291,35 @@ class TuringMachine:
         "HALT",
     )
 
+    # (state, next_state, min_steps, max_steps, max_copy)
+    _CYCLE = (
+        ("OBSERVE", "DESCRIBE", 3, 20, None),
+        ("DESCRIBE", "RELATE", 4, 20, 3),
+        ("RELATE", "ABSTRACT", 5, 22, 3),
+        ("ABSTRACT", "SYNTHESIZE", 4, 24, 2),
+        ("SYNTHESIZE", "REFLECT", 6, 24, 2),
+        ("REFLECT", "HALT", 5, 24, 3),
+    )
+
     def __init__(self, initial_state: str = "OBSERVE") -> None:
         if initial_state not in self.STATES:
             raise ValueError(f"Unknown initial state: {initial_state}")
 
         self.state = initial_state
         self.head = 0
-        self.steps = 0
+        self.steps = 0          # total steps since reset
+        self.state_steps = 0    # steps spent in the current state
 
-        self.transitions: Tuple[TuringTransition, ...] = (
-            TuringTransition(
-                "END", None, +1, "DESCRIBE", 3, 20, None, 20
-            ),
-            TuringTransition(
-                "*", None, +1, "OBSERVE", 0, 20, None, 0
-            ),
-
-            TuringTransition(
-                "END", None, +1, "RELATE", 4, 20, 3, 20
-            ),
-            TuringTransition(
-                "*", None, +1, "DESCRIBE", 0, 20, 3, 0
-            ),
-
-            TuringTransition(
-                "END", None, +1, "ABSTRACT", 5, 22, 3, 20
-            ),
-            TuringTransition(
-                "*", None, +1, "RELATE", 0, 22, 3, 0
-            ),
-
-            TuringTransition(
-                "END", None, +1, "SYNTHESIZE", 4, 24, 2, 20
-            ),
-            TuringTransition(
-                "*", None, +1, "ABSTRACT", 0, 24, 2, 0
-            ),
-
-            TuringTransition(
-                "END", None, +1, "REFLECT", 6, 24, 2, 20
-            ),
-            TuringTransition(
-                "*", None, +1, "SYNTHESIZE", 0, 24, 2, 0
-            ),
-
-            TuringTransition(
-                "END", None, 0, "HALT", 5, 24, 3, 20
-            ),
-            TuringTransition(
-                "*", None, +1, "REFLECT", 0, 24, 3, 0
-            ),
-        )
+        rules: List[TuringTransition] = []
+        for state, nxt, lo, hi, copy in self._CYCLE:
+            # A sentence end after `lo` steps advances the cycle.
+            rules.append(TuringTransition(
+                state, "END", None, 0 if nxt == "HALT" else +1,
+                nxt, lo, hi, copy, 20))
+            # Anything else keeps the machine in the same state.
+            rules.append(TuringTransition(
+                state, "*", None, +1, state, 0, hi, copy, 0))
+        self.transitions: Tuple[TuringTransition, ...] = tuple(rules)
 
     @staticmethod
     def classify(token: str) -> str:
@@ -337,6 +342,7 @@ class TuringMachine:
         self.state = initial_state
         self.head = 0
         self.steps = 0
+        self.state_steps = 0
 
     def read(self, tape: Sequence[str]) -> str:
         if not tape:
@@ -345,35 +351,23 @@ class TuringMachine:
         index = min(max(self.head, 0), len(tape) - 1)
         return tape[index]
 
-    def matching_rules(
-        self,
-        tape: Sequence[str],
-    ) -> List[TuringTransition]:
-        symbol = self.classify(self.read(tape))
+    def matching_rules(self, symbol_token: str) -> List[TuringTransition]:
+        symbol = self.classify(symbol_token)
 
         return [
             rule
             for rule in self.transitions
-            if rule.read in ("*", symbol)
-            and rule.min_steps <= self.steps <= rule.max_steps
+            if rule.state == self.state
+            and rule.read in ("*", symbol)
+            and rule.min_steps <= self.state_steps <= rule.max_steps
         ]
 
-    def step(
-        self,
-        tape: List[str],
-        emitted_token: str,
-    ) -> str:
+    def step(self, tape: List[str], emitted_token: str) -> str:
         """Apply the highest-priority matching rule and return the next state."""
-        symbol = self.classify(emitted_token)
-
-        applicable = [
-            rule
-            for rule in self.transitions
-            if rule.read in ("*", symbol)
-            and rule.min_steps <= self.steps <= rule.max_steps
-        ]
+        applicable = self.matching_rules(emitted_token)
 
         self.steps += 1
+        self.state_steps += 1
 
         if not applicable:
             self.state = "HALT"
@@ -384,14 +378,10 @@ class TuringMachine:
         if rule.write is not None:
             tape.append(rule.write)
 
-        if tape:
-            self.head = max(
-                0,
-                min(len(tape) - 1, self.head + rule.move),
-            )
-        else:
-            self.head = 0
+        self.head = max(0, min(len(tape) - 1, self.head + rule.move)) if tape else 0
 
+        if rule.next_state != self.state:
+            self.state_steps = 0
         self.state = rule.next_state
         return self.state
 
@@ -648,9 +638,16 @@ def harmonization_score(
     without the digit ``1``, prefer ``1`` over ``i`` as the next token. This is
     only a heuristic for token selection; it does not prove or solve algebra,
     and it deliberately does not rewrite the existing tape.
+
+    Exemption: when the context contains the I-II-III-O protocol symbols
+    (II / III), "I" is the stage name Identity, not a mistyped 1, so no
+    adjustment is made.
     """
     recent = list(context[-16:])
     if not recent:
+        return 0.0
+
+    if any(token in PROTOCOL_SYMBOLS for token in recent):
         return 0.0
 
     equation_markers = {"=", "+", "-", "*", "/", "^", "(", ")"}
@@ -687,6 +684,48 @@ def build_corpus_ngrams(
     return ngrams
 
 
+# ---------------------------------------------------------------------------
+# Recursive memory state M_t (stage III of the I-II-III-O loop)
+# ---------------------------------------------------------------------------
+
+MEMORY_WIDTH = 8
+MEMORY_DECAY = 0.7
+_PHI_CACHE: Dict[str, np.ndarray] = {}
+
+
+def _phi(token: str) -> np.ndarray:
+    vec = _PHI_CACHE.get(token)
+    if vec is None:
+        vec = LockedFragments._hash_features(token, MEMORY_WIDTH)
+        _PHI_CACHE[token] = vec
+    return vec
+
+
+def _fold(raw: np.ndarray, token: str) -> np.ndarray:
+    """Recycle one token into the unnormalised memory: raw' = rho*raw + phi(token)."""
+    return MEMORY_DECAY * raw + _phi(token)
+
+
+def _fold_all(tokens: Sequence[str]) -> np.ndarray:
+    raw = np.zeros(MEMORY_WIDTH, dtype=float)
+    for token in tokens:
+        raw = _fold(raw, token)
+    return raw
+
+
+def _unit_state(raw: np.ndarray) -> np.ndarray:
+    n = float(np.linalg.norm(raw))
+    return raw / n if n > 1e-12 else raw
+
+
+def continuity_delta(m_t: np.ndarray, m_next: np.ndarray) -> float:
+    """Delta(M_t, M_{t+1}) in [0, 1]: half the distance between unit states."""
+    return float(np.clip(0.5 * np.linalg.norm(m_t - m_next), 0.0, 1.0))
+
+
+# ---------------------------------------------------------------------------
+# Function inner-product (Gram) matrix
+# ---------------------------------------------------------------------------
 
 def _identity_ast(node: ast.AST, parameter_map: Optional[Dict[str, str]] = None) -> str:
     """Canonicalize an expression for conservative functional-identity matching.
@@ -760,6 +799,19 @@ def _return_identity_features(fn: ast.AST) -> List[str]:
     return identities
 
 
+def _function_nodes_without_nested(function_node: ast.AST) -> List[ast.AST]:
+    """Return a function's AST nodes without counting nested function bodies."""
+    nodes: List[ast.AST] = []
+    stack = list(ast.iter_child_nodes(function_node))
+    while stack:
+        node = stack.pop()
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            continue
+        nodes.append(node)
+        stack.extend(ast.iter_child_nodes(node))
+    return nodes
+
+
 def function_inner_product_matrix(source_path: Optional[Path] = None) -> Tuple[List[str], np.ndarray]:
     """Build an identity-aware Gram matrix for every function/method in source.
 
@@ -820,19 +872,6 @@ def function_inner_product_matrix(source_path: Optional[Path] = None) -> Tuple[L
     return [name for name, _ in definitions], vectors @ vectors.T
 
 
-def _function_nodes_without_nested(function_node: ast.AST) -> List[ast.AST]:
-    """Return a function's AST nodes without counting nested function bodies."""
-    nodes: List[ast.AST] = []
-    stack = list(ast.iter_child_nodes(function_node))
-    while stack:
-        node = stack.pop()
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
-            continue
-        nodes.append(node)
-        stack.extend(ast.iter_child_nodes(node))
-    return nodes
-
-
 def save_function_inner_product_matrix(path: Path, names: Sequence[str], matrix: np.ndarray) -> None:
     """Save the labelled function Gram matrix as CSV."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -842,6 +881,10 @@ def save_function_inner_product_matrix(path: Path, names: Sequence[str], matrix:
         for name, row in zip(names, matrix):
             writer.writerow([name, *[f"{value:.6g}" for value in row]])
 
+
+# ---------------------------------------------------------------------------
+# Generation
+# ---------------------------------------------------------------------------
 
 def generate(
     model: NGramModel,
@@ -859,14 +902,12 @@ def generate(
     lock_ledger: bool = True,
     initial_state: str = "OBSERVE",
     template_associates: int = 4,
+    epsilon: float = 0.6,
+    corpus_ngrams: Optional[Dict[int, Set[Tuple[str, ...]]]] = None,
 ) -> Tuple[str, List[Dict[str, object]], TransitionLedger]:
     """
     Generate text using an ad-hoc template constructed from prompt
-    associations.
-
-    The entire generation process is contained in this function:
-    prompt processing, association lookup, template construction,
-    template filling, and Turing-controlled continuation.
+    associations, continued by a Turing machine through the I-II-III-O loop.
     """
 
     rng = random.Random(seed)
@@ -877,16 +918,11 @@ def generate(
     # Prompt tools.
     # -------------------------------------------------------------
     prompt_tokens = tokenize(prompt) or ["The"]
-
-    def is_content(token: str) -> bool:
-        return len(token) > 3 and token not in PUNCT
-
-    prompt_content = [
-        token for token in prompt_tokens if is_content(token)
-    ]
+    prompt_content = [t for t in prompt_tokens if content_word(t)]
 
     # -------------------------------------------------------------
     # Build a symmetric association table from corpus bigrams.
+    # Punctuation and padding are never associates.
     # -------------------------------------------------------------
     associations: Dict[str, Counter] = defaultdict(Counter)
 
@@ -898,77 +934,48 @@ def generate(
 
         for target, count in targets.items():
             if (
-                source
-                and target
-                and source not in SPECIAL
-                and target not in SPECIAL
+                source and target
+                and source not in SPECIAL and target not in SPECIAL
+                and source not in PUNCT and target not in PUNCT
             ):
                 associations[source][target] += count
                 associations[target][source] += count
 
     def top_associates(word: str, k: int) -> List[str]:
-        counts = associations.get(word, Counter())
-
-        return [
-            token
-            for token, _ in counts.most_common(k)
-            if token not in SPECIAL
-        ]
+        # Try the word as written, then lowercase / capitalised variants.
+        for variant in (word, word.lower(), word.capitalize()):
+            counts = associations.get(variant)
+            if counts:
+                return [t for t, _ in counts.most_common(k) if t not in SPECIAL]
+        return []
 
     # -------------------------------------------------------------
-    # Construct the ad-hoc template.
-    #
-    # Example:
-    #   prompt = "A process"
-    #   template = ["A", "process", "is", "<ASSOC>", "and", "<ASSOC>"]
+    # Construct and fill the ad-hoc template:
+    #   A process is <ASSOC> and <ASSOC>
+    # A slot with no associates is dropped rather than echoing the prompt.
     # -------------------------------------------------------------
-    template: List[str] = list(prompt_tokens)
-    template_slots: List[Tuple[int, str]] = []
+    tape: List[str] = list(prompt_tokens)
+    filled_slots = 0
 
     if prompt_content:
-        template.append("is")
+        slots: List[str] = []
+        for word in prompt_content[:2]:
+            choices = top_associates(word, max(1, template_associates))
+            if choices:
+                slots.append(rng.choice(choices))
 
-        for index, word in enumerate(prompt_content[:2]):
-            if index:
-                template.append("and")
-
-            template.append("<ASSOC>")
-            template_slots.append((len(template) - 1, word))
-
-    # -------------------------------------------------------------
-    # Fill each template slot from its associates.
-    # -------------------------------------------------------------
-    tape: List[str] = []
-
-    for position, token in enumerate(template):
-        if token != "<ASSOC>":
-            tape.append(token)
-            continue
-
-        source_word = next(
-            (
-                word
-                for slot_position, word in template_slots
-                if slot_position == position
-            ),
-            prompt_content[0] if prompt_content else "process",
-        )
-
-        choices = top_associates(
-            source_word,
-            max(1, template_associates),
-        )
-
-        if not choices:
-            choices = [source_word]
-
-        filled = rng.choice(choices)
-        tape.append(filled)
+        if slots:
+            tape.append("is")
+            for index, filled in enumerate(slots):
+                if index:
+                    tape.append("and")
+                tape.append(filled)
+                filled_slots += 1
 
     template_text = detokenize(tape)
 
     if show_trace:
-        print(f"[template] {template_text}")
+        print(f"[template] {template_text}  ({filled_slots} slot(s) filled)")
 
     # -------------------------------------------------------------
     # Optional ledger warm-up.
@@ -989,98 +996,72 @@ def generate(
                 (40, -8.0),
             )
 
-            state = fragments.locked_state(
-                context,
-                token,
-                logp,
-                rank,
-            )
+            state = fragments.locked_state(context, token, logp, rank)
             ledger.record(previous, state)
             previous = state
             context.append(token)
+
+        fragments._cache.clear()
 
         if lock_ledger:
             ledger.lock()
 
     # -------------------------------------------------------------
-    # Turing-controlled continuation.
+    # Turing-controlled continuation: the I-II-III-O loop.
+    # I_0 is the filled template, folded into the recursive memory.
     # -------------------------------------------------------------
     machine = TuringMachine(initial_state)
-    machine.reset()
 
     segments: List[Dict[str, object]] = []
     produced = len(tape)
+    raw = _fold_all(tape)
+    total_relaxations = 0
 
     while produced < token_count:
         emitted: List[str] = []
         fallbacks = 0
+        relaxations = 0
         closed = False
         start_step = produced
+        segment_state = machine.state
 
         for local in range(max(1, token_count - produced)):
-            lam = adiabatic_lambda(
-                start_step + local,
-                max(1, token_count),
-            )
+            lam = adiabatic_lambda(start_step + local, max(1, token_count))
             state = machine.state
+            m_t = _unit_state(raw)
 
+            # ---- Stage I: Identity (recognise state, propose candidates) --
             ranked = [
                 (token, logp)
                 for token, logp in model.candidates(
-                    tape,
-                    limit=max(40, beam_size * 8),
+                    tape, limit=max(40, beam_size * 8)
                 )
                 if token not in SPECIAL
             ]
 
-            if machine.steps < 3:
-                nonterminal = [
-                    (token, logp)
-                    for token, logp in ranked
-                    if token not in END
-                ]
-
+            if machine.state_steps < 3:
+                nonterminal = [(t, lp) for t, lp in ranked if t not in END]
                 if nonterminal:
                     ranked = nonterminal
 
             # State-specific hard constraints.
             if state == "DESCRIBE":
-                recent = {
-                    token
-                    for token in tape[-12:]
-                    if is_content(token)
-                }
-
-                filtered = [
-                    (token, logp)
-                    for token, logp in ranked
-                    if token not in recent
-                ]
-
+                recent = {t for t in tape[-12:] if content_word(t)}
+                filtered = [(t, lp) for t, lp in ranked if t not in recent]
                 if filtered:
                     ranked = filtered
 
             elif state == "ABSTRACT":
                 filtered = [
-                    (token, logp)
-                    for token, logp in ranked
-                    if token in PUNCT
-                    or len(token) <= 3
-                    or len(token) >= 7
+                    (t, lp) for t, lp in ranked
+                    if t in PUNCT or len(t) <= 3 or len(t) >= 7
                 ]
-
                 if filtered:
                     ranked = filtered
 
             elif state == "RELATE":
                 local_tail = set(tape[-8:])
-
-                filtered = [
-                    (token, logp)
-                    for token, logp in ranked
-                    if token not in local_tail
-                ]
-
+                filtered = [(t, lp) for t, lp in ranked if t not in local_tail]
                 if filtered:
                     ranked = filtered
 
@@ -1088,116 +1069,91 @@ def generate(
                 fallbacks += 1
                 ranked = [(".", -8.0)]
 
+            # ---- Stage II: Correspondence (context <-> candidate) ---------
             scored: List[Candidate] = []
 
             for rank, (token, logp) in enumerate(ranked):
-                fragments.locked_state(
-                    tape,
-                    token,
-                    logp,
-                    rank,
-                )
+                fragments.locked_state(tape, token, logp, rank)
 
                 score, consistency = fragments.score(
-                    tape,
-                    token,
-                    logp,
-                    rank,
-                    lam,
+                    tape, token, logp, rank, lam
                 )
-                score += harmonization_score(
-                    tape,
-                    token,
-                    strength=0.75,
-                )
+                score += harmonization_score(tape, token, strength=0.75)
 
-                if (
-                    state == "ABSTRACT"
-                    and len(token) >= 7
-                    and token not in PUNCT
-                ):
+                if state == "ABSTRACT" and len(token) >= 7 and token not in PUNCT:
                     score += 1.0
-                elif state == "DESCRIBE" and is_content(token):
+                elif state == "DESCRIBE" and content_word(token):
                     score += 0.8
-                elif state == "RELATE" and is_content(token):
+                elif state == "RELATE" and content_word(token):
                     score += 0.4
                 elif state == "REFLECT":
                     score += 0.2
 
                 alignment = float(
-                    np.clip(
-                        (score - logp) / 2.5 + 0.5,
-                        0.0,
-                        1.0,
-                    )
+                    np.clip((score - logp) / 2.5 + 0.5, 0.0, 1.0)
                 )
 
                 if consistency <= tau:
+                    delta = continuity_delta(
+                        m_t, _unit_state(_fold(raw, token))
+                    )
                     scored.append(
-                        Candidate(
-                            token,
-                            logp,
-                            score,
-                            consistency,
-                            alignment,
-                        )
+                        Candidate(token, logp, score, consistency,
+                                  alignment, delta=delta)
                     )
 
             if not scored:
                 token, logp = ranked[0]
                 fragments.locked_state(tape, token, logp, 0)
-
                 score, consistency = fragments.score(
-                    tape,
-                    token,
-                    logp,
-                    0,
-                    lam,
+                    tape, token, logp, 0, lam
                 )
-
+                delta = continuity_delta(m_t, _unit_state(_fold(raw, token)))
                 scored = [
-                    Candidate(
-                        token,
-                        logp,
-                        score,
-                        consistency,
-                        0.5,
-                    )
+                    Candidate(token, logp, score, consistency, 0.5,
+                              delta=delta)
                 ]
 
-            scored.sort(
-                key=lambda candidate: candidate.score,
-                reverse=True,
-            )
+            # ---- Stage III: Verification (Delta <= epsilon) ---------------
+            # Relax epsilon instead of rejecting everything, so ordinary
+            # variation is not misclassified as an error.
+            eps_eff = max(1e-6, epsilon)
+            verified = [c for c in scored if c.delta <= eps_eff]
+            while not verified and eps_eff < 1.0:
+                eps_eff = min(1.0, eps_eff * 1.5)
+                relaxations += 1
+                verified = [c for c in scored if c.delta <= eps_eff]
+            if not verified:
+                verified = [min(scored, key=lambda c: c.delta)]
 
-            beam = scored[:max(1, beam_size)]
-            probabilities = softmax(
-                [candidate.score for candidate in beam],
-                temperature,
-            )
+            verified.sort(key=lambda c: c.score, reverse=True)
+            beam = verified[:max(1, beam_size)]
+            probabilities = softmax([c.score for c in beam], temperature)
+
+            for candidate, probability in zip(beam, probabilities):
+                candidate.probability = float(probability)
 
             if temperature <= 0.01:
                 chosen = beam[0]
             else:
-                chosen = rng.choices(
-                    beam,
-                    weights=probabilities,
-                    k=1,
-                )[0]
+                chosen = rng.choices(beam, weights=probabilities, k=1)[0]
 
+            # ---- Stage O: Recycling (I_{t+1} = O_t) ------------------------
             fragments.commit(chosen.token)
             tape.append(chosen.token)
             emitted.append(chosen.token)
             produced += 1
+            raw = _fold(raw, chosen.token)
 
             if show_trace:
                 print(
                     f"[{start_step + local:03d}] "
-                    f"{machine.state:<10} "
+                    f"{state:<10} "
                     f"{chosen.token!r:<16} "
                     f"p={math.exp(chosen.base_logp):.2f} "
                     f"score={chosen.score:+.3f} "
-                    f"D={chosen.consistency:.3f}"
+                    f"D={chosen.consistency:.3f} "
+                    f"delta={chosen.delta:.3f}"
                 )
 
             next_state = machine.step(tape, chosen.token)
@@ -1206,33 +1162,46 @@ def generate(
                 closed = chosen.token in END
                 break
 
+        # Close an unfinished segment. The tape is edited too, so segment
+        # text and tape always agree.
         if emitted and emitted[-1] not in END:
             if emitted[-1] in PUNCT:
                 emitted[-1] = "."
+                tape[-1] = "."
             else:
                 emitted.append(".")
-
+                tape.append(".")
+                produced += 1
             closed = True
+            raw = _fold_all(tape)
+
+        total_relaxations += relaxations
 
         segments.append(
             {
                 "template": template_text,
-                "state": machine.state,
+                "state": segment_state,
+                "end_state": machine.state,
                 "steps": machine.steps,
                 "tokens": emitted,
                 "text": detokenize(emitted),
                 "natural_rate": natural_rate(model, emitted),
-                "novelty": novelty(
-                    build_corpus_ngrams([tape]),
-                    emitted,
+                "novelty": (
+                    novelty(corpus_ngrams, emitted)
+                    if corpus_ngrams is not None
+                    else 1.0
                 ),
                 "fallbacks": fallbacks,
+                "relaxations": relaxations,
                 "closed": closed,
             }
         )
 
         if machine.is_halted():
             machine.reset("OBSERVE")
+
+    if show_trace:
+        print(f"[continuity] epsilon relaxations: {total_relaxations}")
 
     return detokenize(tape), segments, ledger
 
@@ -1241,7 +1210,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
             "Turing state-machine text generator using an ad-hoc "
-            "association template constructed inside generate()."
+            "association template and the I-II-III-O memory loop."
         )
     )
 
@@ -1251,11 +1220,23 @@ def main() -> None:
         help="UTF-8 corpus file; omit to use the built-in corpus.",
     )
     parser.add_argument("--prompt", default="A process")
+    parser.add_argument(
+        "--interactive",
+        action="store_true",
+        help="Read prompts from stdin repeatedly (blank line or EOF quits).",
+    )
     parser.add_argument("--tokens", type=int, default=500)
     parser.add_argument("--order", type=int, default=5)
     parser.add_argument("--alpha", type=float, default=0.25)
     parser.add_argument("--beam", type=int, default=12)
     parser.add_argument("--tau", type=float, default=0.95)
+    parser.add_argument(
+        "--epsilon",
+        type=float,
+        default=0.6,
+        help="Max continuity deviation Delta(M_t, M_t+1) per token (0..1); "
+             "relaxed automatically if nothing passes.",
+    )
     parser.add_argument("--temperature", type=float, default=0.85)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument(
@@ -1282,8 +1263,8 @@ def main() -> None:
         action="store_true",
         help="Print the template and per-token generation trace.",
     )
-    parser.add_argument("--save")
-    parser.add_argument("--segments-json")
+    parser.add_argument("--save", help="Write the generated text to this file.")
+    parser.add_argument("--segments-json", help="Write segment statistics to this JSON file.")
     parser.add_argument(
         "--function-matrix",
         nargs="?",
@@ -1298,20 +1279,15 @@ def main() -> None:
 
     args = parser.parse_args()
 
-    if args.corpus:
-        corpus_path = Path(args.corpus)
+    corpus_path = Path(input("Filename: "))
 
-        if not corpus_path.is_file():
-            parser.error(f"Corpus file not found: {corpus_path}")
+ 
 
-        try:
-            corpus_text = corpus_path.read_text(encoding="utf-8-sig")
-        except UnicodeDecodeError as exc:
-            parser.error(
-                f"Could not decode corpus as UTF-8: {exc}"
-            )
-    else:
-        corpus_text = BUILTIN_CORPUS
+    try:
+        corpus_text = corpus_path.read_text(encoding="utf-8-sig")
+    except UnicodeDecodeError as exc:
+        parser.error(f"Could not decode corpus as UTF-8: {exc}")
+    
 
     corpus_tokens = tokenize(corpus_text)
 
@@ -1320,6 +1296,15 @@ def main() -> None:
 
     model = NGramModel(order=args.order, alpha=args.alpha)
     model.train(corpus_text)
+
+    # Corpus n-grams for the novelty statistic (built once, from the corpus
+    # itself rather than from the generated tape).
+    corpus_sentences = [
+        tokenize(s)
+        for s in re.split(r"(?<=[.!?])\s+", corpus_text.strip())
+        if s.strip()
+    ]
+    corpus_ngrams = build_corpus_ngrams(corpus_sentences)
 
     if args.function_matrix or args.show_function_matrix:
         try:
@@ -1338,14 +1323,14 @@ def main() -> None:
             np.set_printoptions(precision=1, suppress=True, linewidth=180)
             print(gram_matrix)
 
-    while True:
-        text, segments, ledger = generate(
+    def run(prompt: str) -> None:
+        text, segments, _ledger = generate(
             model,
-            input("prompt> "),
+            input("Prompt> "),
             token_count=max(1, args.tokens),
             beam_size=max(1, args.beam),
-            tau=args.tau,
-            temperature=args.temperature,
+            tau=float(np.clip(args.tau, 0.0, 1.0)),
+            temperature=max(0.0, args.temperature),
             seed=args.seed,
             show_trace=args.trace,
             levels=args.levels,
@@ -1358,10 +1343,36 @@ def main() -> None:
             lock_ledger=not args.keep_learning,
             initial_state=args.initial_state,
             template_associates=max(1, args.template_associates),
+            epsilon=float(np.clip(args.epsilon, 0.0, 1.0)),
+            corpus_ngrams=corpus_ngrams,
         )
 
         print("\n--- GENERATED TEXT ---\n")
         print(text)
+
+        if args.save:
+            Path(args.save).write_text(text, encoding="utf-8")
+            print(f"\n[Saved output to {args.save}]")
+
+        if args.segments_json:
+            Path(args.segments_json).write_text(
+                json.dumps(segments, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            print(f"[Saved segments to {args.segments_json}]")
+
+    if args.interactive:
+        while True:
+            try:
+                prompt = input("prompt> ")
+            except EOFError:
+                break
+            if not prompt.strip():
+                break
+            run(prompt)
+    else:
+        run(args.prompt)
+
 
 if __name__ == "__main__":
     main()
