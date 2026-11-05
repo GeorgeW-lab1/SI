@@ -857,6 +857,63 @@ def continuity_delta(m_t: np.ndarray, m_next: np.ndarray) -> float:
 
 
 # ---------------------------------------------------------------------------
+# Stage-aware synthesis: real composition of prior Turing-stage evidence
+# ---------------------------------------------------------------------------
+
+STAGE_KEYS = (
+    "OBSERVE", "DESCRIBE", "RELATE", "ABSTRACT", "SYNTHESIZE", "REFLECT",
+)
+
+# Relative contribution of each completed stage to the synthesized process state.
+SYNTHESIS_WEIGHTS = {
+    "OBSERVE": 0.20,
+    "DESCRIBE": 0.25,
+    "RELATE": 0.25,
+    "ABSTRACT": 0.30,
+}
+
+
+def new_stage_memory() -> Dict[str, np.ndarray]:
+    """Create one decaying memory vector per Turing process stage."""
+    return {key: np.zeros(MEMORY_WIDTH, dtype=float) for key in STAGE_KEYS}
+
+
+def update_stage_memory(
+    stage_memory: Dict[str, np.ndarray],
+    state: str,
+    token: str,
+    decay: float = 0.7,
+) -> None:
+    """Fold a token into the memory belonging to the stage that emitted it."""
+    if state not in stage_memory:
+        return
+    stage_memory[state] = decay * stage_memory[state] + _phi(token)
+
+
+def synthesize_stage_memory(
+    stage_memory: Dict[str, np.ndarray],
+) -> np.ndarray:
+    """Compose OBSERVE/DESCRIBE/RELATE/ABSTRACT evidence into SYNTHESIZE."""
+    combined = np.zeros(MEMORY_WIDTH, dtype=float)
+
+    for stage, weight in SYNTHESIS_WEIGHTS.items():
+        vector = _unit_state(stage_memory.get(stage, np.zeros(MEMORY_WIDTH)))
+        combined += weight * vector
+
+    return _unit_state(combined)
+
+
+def synthesis_affinity(
+    token: str,
+    synthesis_vector: np.ndarray,
+) -> float:
+    """Alignment between a candidate token and the synthesized process state."""
+    if float(np.linalg.norm(synthesis_vector)) < 1e-9:
+        return 0.0
+    return float(np.dot(_phi(token), synthesis_vector))
+
+
+# ---------------------------------------------------------------------------
 # Function inner-product (Gram) matrix
 # ---------------------------------------------------------------------------
 
@@ -1165,6 +1222,12 @@ def _generate(
     # -------------------------------------------------------------
     machine = TuringMachine(initial_state)
 
+    # Stage-aware processual control: each Turing stage retains evidence from
+    # the tokens it generated; SYNTHESIZE composes those stage memories.
+    stage_memory = new_stage_memory()
+    previous_machine_state = machine.state
+    synthesis_vector = np.zeros(MEMORY_WIDTH, dtype=float)
+
     segments: List[Dict[str, object]] = []
     produced = len(tape)
     raw = _fold_all(tape)
@@ -1243,6 +1306,26 @@ def _generate(
                     score += 0.4
                 elif state == "REFLECT":
                     score += 0.2
+
+                # Processual synthesis: in SYNTHESIZE, prefer candidates that
+                # continue the process assembled from prior stages. In REFLECT,
+                # prefer candidates that reduce divergence between the
+                # synthesized process state and the actual generated tape.
+                if state == "SYNTHESIZE":
+                    score += 0.8 * synthesis_affinity(
+                        token, synthesis_vector
+                    )
+                elif state == "REFLECT":
+                    process_state = _unit_state(
+                        stage_memory.get("SYNTHESIZE", synthesis_vector)
+                    )
+                    global_state = _unit_state(raw)
+                    current_gap = continuity_delta(process_state, global_state)
+                    next_global_state = _unit_state(_fold(raw, token))
+                    next_gap = continuity_delta(
+                        process_state, next_global_state
+                    )
+                    score += 1.0 * (current_gap - next_gap)
 
                 alignment = float(
                     np.clip((score - logp) / 2.5 + 0.5, 0.0, 1.0)
@@ -1338,6 +1421,17 @@ def _generate(
                 )
 
             next_state = machine.step(tape, chosen.token)
+
+            # Record the emitted token in the memory of the stage that chose it.
+            update_stage_memory(stage_memory, state, chosen.token)
+
+            # When the process enters SYNTHESIZE, compose the evidence left by
+            # OBSERVE, DESCRIBE, RELATE, and ABSTRACT into a real synthesis state.
+            if next_state == "SYNTHESIZE" and previous_machine_state != "SYNTHESIZE":
+                synthesis_vector = synthesize_stage_memory(stage_memory)
+                stage_memory["SYNTHESIZE"] = synthesis_vector
+
+            previous_machine_state = next_state
 
             if next_state == "HALT":
                 closed = chosen.token in END
