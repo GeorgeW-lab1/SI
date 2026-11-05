@@ -1,20 +1,24 @@
 #!/usr/bin/env python3
 """
-Turing state-machine text generator driven by a combinatoric mechanism
-======================================================================
+Turing state-machine text generator + combinatoric mechanism + Gradio GUI
+=========================================================================
 
-Run it:   python discrete_lock_turing.py        (no arguments; it asks you)
-Settings: edit CONFIG near the bottom of this file.
+Everything lives in this one file.
 
-Every generated token is elected by the combinatoric mechanism
-(combinatoric_mechanism.py): the generator's algorithms are split into atoms
-(n-gram probability, adiabatic ramp, fragment alignment/consistency, ledger,
-Turing-state bonus, harmonization, association affinity, continuity delta,
-corpus 4-grams, the state filters, the tau/epsilon gates) and a few hundred
-subsets of those atoms each vote for a token at every step.  The votes are the
-token distribution.
+Run it:     python turing_generator_gradio.py
+Install:    python -m pip install gradio numpy        (+ datasets for hf: corpora)
+Settings:   edit CONFIG below, or use the GUI controls.
 
-The I-II-III-O loop, Turing states, ledger and fragments are unchanged:
+Every generated token is elected by the combinatoric mechanism: the generator's
+algorithms are split into 15 atoms (n-gram probability, adiabatic ramp,
+fragment alignment, fragment consistency, ledger, Turing-state bonus,
+harmonization, association affinity, continuity delta, corpus 4-grams, state
+filter, tau gate, epsilon gate, rank prior, repetition penalty) and a few
+hundred subsets of those atoms each vote for a token at every step.  The votes
+are the token distribution.
+
+If a separate `combinatoric_mechanism.py` sits next to this file it is used;
+otherwise the built-in implementation below is used.
 
   I Identity -> II Correspondence -> III Verification -> O Recycling
   M_{t+1} = O(III(II(I(M_t))))        I_{t+1} = O_t
@@ -24,361 +28,21 @@ API:  load_corpus, TextEngine, generate_text, build_dataset
 
 from __future__ import annotations
 
-import argparse
 import ast
+import contextlib
 import csv
+import io
 import json
 import math
 import random
 import re
 import sys
+import tempfile
+import threading
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
-
-import contextlib
-import io
-import json
-import sys
-import tempfile
-import threading
-
-import gradio as gr
-import pandas as pd
-"""
-Gradio GUI for the Turing state-machine text generator.
-
-Put this file in the same folder as:
-    discrete_lock_turing.py        (the generator you posted)
-    combinatoric_mechanism.py      (required by the generator)
-
-Install:  python -m pip install gradio numpy
-Run:      python gradio_app.py
-"""
-
-
-
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-
-
-_LOCK = threading.Lock()  # stdout capture + shared CONFIG are not thread-safe
-
-SEGMENT_COLUMNS = [
-    "state", "end_state", "steps", "text", "natural_rate",
-    "novelty", "fallbacks", "relaxations", "closed", "mechanism_agreement",
-]
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def _paths(files: Any) -> List[str]:
-    """Normalise gr.File output across Gradio versions."""
-    if not files:
-        return []
-    if not isinstance(files, (list, tuple)):
-        files = [files]
-    out = []
-    for f in files:
-        out.append(str(getattr(f, "name", f)))
-    return out
-
-
-def _segments_df(segments: List[Dict[str, Any]]) -> pd.DataFrame:
-    rows = []
-    for s in segments:
-        row = {k: s.get(k) for k in SEGMENT_COLUMNS}
-        for k in ("natural_rate", "novelty", "mechanism_agreement"):
-            if isinstance(row[k], float):
-                row[k] = round(row[k], 3)
-        rows.append(row)
-    return pd.DataFrame(rows, columns=SEGMENT_COLUMNS)
-
-
-def _gen_options(tokens, n_masks, beam, tau, epsilon, temperature, levels,
-                 ledger_weight, keep_learning, initial_state,
-                 template_associates) -> Dict[str, Any]:
-    return dict(
-        tokens=int(tokens),
-        n_masks=int(n_masks),
-        beam=int(beam),
-        tau=float(tau),
-        epsilon=float(epsilon),
-        temperature=float(temperature),
-        levels=int(levels),
-        ledger_weight=float(ledger_weight),
-        keep_learning=bool(keep_learning),
-        initial_state=str(initial_state),
-        template_associates=int(template_associates),
-    )
-
-
-# ---------------------------------------------------------------------------
-# Callbacks
-# ---------------------------------------------------------------------------
-
-def load_engine(files, paths_text, pasted, order, alpha, warm_limit,
-                hf_max, hf_stream):
-    sources = _paths(files)
-    sources += [p.strip() for p in (paths_text or "").split("|") if p.strip()]
-
-    try:
-        with _LOCK:
-            dlt.CONFIG["hf_max_samples"] = int(hf_max)
-            dlt.CONFIG["hf_streaming"] = bool(hf_stream)
-
-            texts: List[str] = []
-            used: List[str] = []
-            if sources:
-                text, used = dlt.load_corpus(sources)
-                texts.append(text)
-            if (pasted or "").strip():
-                texts.append(pasted.strip())
-                used.append("<pasted text>")
-            if not texts:
-                text, used = dlt.load_corpus(None)  # built-in corpus
-                texts.append(text)
-
-            engine = dlt.TextEngine(
-                corpus_text="\n\n".join(texts),
-                order=int(order),
-                alpha=float(alpha),
-                warm_limit=int(warm_limit),
-            )
-            engine.sources = used
-    except Exception as exc:  # noqa: BLE001
-        return None, f"❌ Could not load corpus: {exc}"
-
-    status = (
-        f"✅ Loaded **{len(engine.corpus_tokens):,}** tokens from "
-        f"**{len(used)}** source(s) · vocab {len(engine.model.vocab):,} · "
-        f"{len(engine.sentences):,} sentences\n\n"
-        + "\n".join(f"- `{u}`" for u in used[:20])
-        + ("\n- …" if len(used) > 20 else "")
-    )
-    return engine, status
-
-
-def run_generate(engine, prompt, seed, trace, *opts):
-    if engine is None:
-        raise gr.Error("Load a corpus first (Corpus tab).")
-    options = _gen_options(*opts)
-    prompt = (prompt or "").strip() or dlt.CONFIG["default_prompt"]
-
-    buf = io.StringIO()
-    try:
-        with _LOCK, contextlib.redirect_stdout(buf):
-            result = engine.generate_text(
-                prompt, seed=int(seed), trace=bool(trace), **options)
-    except Exception as exc:  # noqa: BLE001
-        raise gr.Error(f"Generation failed: {exc}")
-
-    summary = {
-        k: result[k] for k in (
-            "prompt", "seed", "n_tokens", "n_segments", "mean_natural_rate",
-            "mean_novelty", "mean_agreement", "relaxations", "fallbacks",
-            "ledger")
-    }
-    return (
-        result["text"],
-        json.dumps(summary, indent=2, default=float),
-        _segments_df(result["segments"]),
-        buf.getvalue() or "(trace off)",
-    )
-
-
-def run_dataset(engine, custom_prompts, n_prompts, n_seeds, base_seed, fmt,
-                include_segments, *opts):
-    if engine is None:
-        raise gr.Error("Load a corpus first (Corpus tab).")
-    options = _gen_options(*opts)
-
-    prompts = [p.strip() for p in (custom_prompts or "").splitlines() if p.strip()]
-    if not prompts:
-        prompts = engine.auto_prompts(int(n_prompts), int(base_seed))
-    seeds = [int(base_seed) + i for i in range(int(n_seeds))]
-
-    out_dir = Path(tempfile.mkdtemp(prefix="dataset_"))
-    out_path = out_dir / f"generated_dataset.{fmt}"
-
-    buf = io.StringIO()
-    try:
-        with _LOCK, contextlib.redirect_stdout(buf):
-            rows = dlt.build_dataset(
-                engine, prompts, seeds=seeds, out_path=str(out_path),
-                include_segments=bool(include_segments), progress=True,
-                **options)
-    except Exception as exc:  # noqa: BLE001
-        raise gr.Error(f"Dataset build failed: {exc}")
-
-    preview = pd.DataFrame([
-        {
-            "id": r["id"], "prompt": r["prompt"], "seed": r["seed"],
-            "n_tokens": r["n_tokens"], "n_segments": r["n_segments"],
-            "mean_novelty": round(r["mean_novelty"], 3),
-            "mean_agreement": (None if r["mean_agreement"] is None
-                               else round(r["mean_agreement"], 3)),
-            "text": r["text"],
-        }
-        for r in rows
-    ])
-    return str(out_path), preview, buf.getvalue()
-
-
-def run_matrix():
-    try:
-        names, gram = dlt.function_inner_product_matrix(Path(dlt.__file__))
-    except Exception as exc:  # noqa: BLE001
-        raise gr.Error(f"Could not build matrix: {exc}")
-    out = Path(tempfile.mkdtemp(prefix="matrix_")) / "function_inner_product.csv"
-    dlt.save_function_inner_product_matrix(out, names, gram)
-    df = pd.DataFrame(gram, columns=names)
-    df.insert(0, "function", names)
-    return str(out), df, f"{len(names)} × {len(names)} Gram matrix"
-
-
-# ---------------------------------------------------------------------------
-# UI
-# ---------------------------------------------------------------------------
-
-def build_ui() -> gr.Blocks:
-    C = dlt.CONFIG
-    states = [s for s in dlt.TuringMachine.STATES if s != "HALT"]
-
-    with gr.Blocks(title="Turing Text Generator", theme=gr.themes.Soft()) as demo:
-        gr.Markdown(
-            "# Turing state-machine text generator\n"
-            "Combinatoric-mechanism voting · I-II-III-O loop")
-        engine_state = gr.State(None)
-
-        # Generation settings are shared between the Generate and Dataset tabs.
-        with gr.Accordion("Generation settings", open=False):
-            with gr.Row():
-                tokens = gr.Slider(10, 2000, value=C["tokens"], step=10,
-                                   label="Tokens")
-                n_masks = gr.Number(value=C["n_masks"], precision=0,
-                                    minimum=1, maximum=32767,
-                                    label="Atom subsets voting (n_masks, max 32767)")
-                beam = gr.Slider(1, 64, value=C["beam"], step=1, label="Beam")
-            with gr.Row():
-                tau = gr.Slider(0, 1, value=C["tau"], step=0.01, label="tau")
-                epsilon = gr.Slider(0, 1, value=C["epsilon"], step=0.01,
-                                    label="epsilon")
-                temperature = gr.Slider(0, 2, value=C["temperature"], step=0.01,
-                                        label="Temperature")
-            with gr.Row():
-                levels = gr.Slider(2, 12, value=C["levels"], step=1,
-                                   label="Quantization levels")
-                ledger_weight = gr.Slider(0, 3, value=C["ledger_weight"],
-                                          step=0.05, label="Ledger weight")
-                template_associates = gr.Slider(
-                    1, 12, value=C["template_associates"], step=1,
-                    label="Template associates")
-            with gr.Row():
-                initial_state = gr.Dropdown(states, value=C["initial_state"],
-                                            label="Initial Turing state")
-                keep_learning = gr.Checkbox(value=C["keep_learning"],
-                                            label="Keep learning (don't lock ledger)")
-        gen_inputs = [tokens, n_masks, beam, tau, epsilon, temperature, levels,
-                      ledger_weight, keep_learning, initial_state,
-                      template_associates]
-
-        with gr.Tabs():
-            # ------------------------------------------------------------ Corpus
-            with gr.Tab("1 · Corpus"):
-                gr.Markdown("Leave everything empty to use the built-in corpus.")
-                files = gr.File(label="Upload corpus files "
-                                      "(.txt .md .rst .json .jsonl .csv)",
-                                file_count="multiple")
-                paths_text = gr.Textbox(
-                    label="Paths / Hugging Face specs (separate with |)",
-                    placeholder="my_folder | hf:wikitext:wikitext-2-raw-v1:train:text")
-                pasted = gr.Textbox(label="Or paste text", lines=5)
-                with gr.Row():
-                    order = gr.Slider(1, 8, value=C["order"], step=1,
-                                      label="n-gram order")
-                    alpha = gr.Slider(0.01, 2, value=C["alpha"], step=0.01,
-                                      label="Smoothing alpha")
-                    warm_limit = gr.Number(value=C["warm_limit"], precision=0,
-                                           label="Ledger warm-up tokens")
-                with gr.Row():
-                    hf_max = gr.Number(value=C["hf_max_samples"], precision=0,
-                                       label="HF max rows")
-                    hf_stream = gr.Checkbox(value=C["hf_streaming"],
-                                            label="HF streaming")
-                load_btn = gr.Button("Load corpus / train model", variant="primary")
-                status = gr.Markdown("_No corpus loaded yet._")
-                load_btn.click(
-                    load_engine,
-                    [files, paths_text, pasted, order, alpha, warm_limit,
-                     hf_max, hf_stream],
-                    [engine_state, status])
-
-            # ---------------------------------------------------------- Generate
-            with gr.Tab("2 · Generate"):
-                with gr.Row():
-                    prompt = gr.Textbox(label="Prompt", value=C["default_prompt"],
-                                        scale=4)
-                    seed = gr.Number(value=C["seed"], precision=0, label="Seed",
-                                     scale=1)
-                    trace = gr.Checkbox(value=False, label="Per-token trace",
-                                        scale=1)
-                gen_btn = gr.Button("Generate", variant="primary")
-                out_text = gr.Textbox(label="Generated text", lines=12,
-                                      show_copy_button=True)
-                with gr.Row():
-                    out_summary = gr.Code(label="Run summary", language="json")
-                    out_trace = gr.Textbox(label="Trace", lines=12)
-                out_segments = gr.Dataframe(label="Segments", wrap=True)
-                gen_btn.click(
-                    run_generate,
-                    [engine_state, prompt, seed, trace, *gen_inputs],
-                    [out_text, out_summary, out_segments, out_trace])
-                prompt.submit(
-                    run_generate,
-                    [engine_state, prompt, seed, trace, *gen_inputs],
-                    [out_text, out_summary, out_segments, out_trace])
-
-            # ----------------------------------------------------------- Dataset
-            with gr.Tab("3 · Dataset"):
-                custom_prompts = gr.Textbox(
-                    label="Prompts (one per line; leave blank to draw them "
-                          "from the corpus)", lines=5)
-                with gr.Row():
-                    n_prompts = gr.Slider(1, 500, value=C["dataset_prompts"],
-                                          step=1, label="Auto prompts")
-                    n_seeds = gr.Slider(1, 20, value=C["dataset_seeds"], step=1,
-                                        label="Samples per prompt")
-                    base_seed = gr.Number(value=C["seed"], precision=0,
-                                          label="Base seed")
-                with gr.Row():
-                    fmt = gr.Radio(["jsonl", "csv"], value="jsonl",
-                                   label="Format")
-                    include_segments = gr.Checkbox(
-                        value=True, label="Include segments (JSONL only)")
-                ds_btn = gr.Button("Build dataset", variant="primary")
-                ds_file = gr.File(label="Download dataset")
-                ds_preview = gr.Dataframe(label="Preview", wrap=True)
-                ds_log = gr.Textbox(label="Progress log", lines=6)
-                ds_btn.click(
-                    run_dataset,
-                    [engine_state, custom_prompts, n_prompts, n_seeds,
-                     base_seed, fmt, include_segments, *gen_inputs],
-                    [ds_file, ds_preview, ds_log])
-
-            # ------------------------------------------------------------ Matrix
-            with gr.Tab("4 · Function Gram matrix"):
-                gr.Markdown("Identity-aware inner-product matrix of every "
-                            "function/method in the generator source.")
-                mx_btn = gr.Button("Compute matrix")
-                mx_info = gr.Markdown()
-                mx_file = gr.File(label="Download CSV")
-                mx_df = gr.Dataframe(label="Matrix", wrap=False)
-                mx_btn.click(run_matrix, None, [mx_file, mx_df, mx_info])
-
-    return demo
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 try:
     import numpy as np
@@ -387,9 +51,10 @@ except ImportError as exc:
         "NumPy is required. Install it with: python -m pip install numpy"
     ) from exc
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from combinatoric_mechanism import MechanismCombinator, StepContext  # noqa: E402
-
+try:
+    from __main__ import __file__ as _main_file  # noqa: F401
+except Exception:  # pragma: no cover
+    pass
 
 TOKEN_RE = re.compile(
     r"[A-Za-z]+(?:['’][A-Za-z]+)*|\d+(?:\.\d+)?|[^\w\s]",
@@ -482,6 +147,162 @@ def novelty(
 
     return 1.0 - len(covered) / n
 
+
+def content_word(token: str) -> bool:
+    return len(token) > 3 and token not in PUNCT
+
+
+# ---------------------------------------------------------------------------
+# Combinatoric mechanism (built in; an external combinatoric_mechanism.py
+# next to this file takes precedence if present)
+# ---------------------------------------------------------------------------
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+try:
+    from combinatoric_mechanism import MechanismCombinator, StepContext  # type: ignore
+    MECHANISM_SOURCE = "external combinatoric_mechanism.py"
+except ImportError:
+    MECHANISM_SOURCE = "built-in"
+
+    ATOM_NAMES = (
+        "ngram", "ramp", "alignment", "consistency", "ledger", "turing_state",
+        "harmonization", "association", "continuity", "corpus_4gram",
+        "state_filter", "tau_gate", "epsilon_gate", "rank_prior", "repetition",
+    )
+
+    @dataclass
+    class StepContext:  # type: ignore[no-redef]
+        tape: List[str]
+        ranked: List[Tuple[str, float]]
+        state: str
+        lam: float
+        fragments: Any
+        delta_fn: Callable[[str], float]
+        harm_fn: Callable[[str], float]
+        associations: Dict[str, Counter]
+        anchors: List[str]
+        corpus_ngrams: Optional[Dict[int, Set[Tuple[str, ...]]]]
+        tau: float
+        epsilon: float
+
+    class MechanismCombinator:  # type: ignore[no-redef]
+        """Every non-empty subset of atoms (up to n_masks of the 2^15-1) votes."""
+
+        def __init__(self, n_masks: int = 512, seed: int = 7) -> None:
+            n_atoms = len(ATOM_NAMES)
+            space = 2 ** n_atoms - 1
+            n = max(1, min(int(n_masks), space))
+            rng = random.Random(seed)
+            codes = (list(range(1, space + 1)) if n == space
+                     else rng.sample(range(1, space + 1), n))
+            self.masks: List[int] = codes
+            self.matrix = np.array(
+                [[(c >> b) & 1 for b in range(n_atoms)] for c in codes],
+                dtype=float)
+
+        # -- atom values for every candidate: shape (n_candidates, n_atoms) --
+        @staticmethod
+        def _association(ctx: StepContext, token: str) -> float:
+            if not ctx.anchors:
+                return 0.0
+            total = 0.0
+            for anchor in ctx.anchors:
+                for variant in (anchor, anchor.lower(), anchor.capitalize()):
+                    counts = ctx.associations.get(variant)
+                    if counts:
+                        total += counts.get(token, 0) or counts.get(token.lower(), 0)
+                        break
+            return math.log1p(total)
+
+        @staticmethod
+        def _state_filter(ctx: StepContext, token: str) -> float:
+            if ctx.state == "DESCRIBE":
+                recent = {t for t in ctx.tape[-12:] if content_word(t)}
+                return -1.0 if token in recent else 0.0
+            if ctx.state == "ABSTRACT":
+                ok = token in PUNCT or len(token) <= 3 or len(token) >= 7
+                return 0.0 if ok else -1.0
+            if ctx.state == "RELATE":
+                return -1.0 if token in set(ctx.tape[-8:]) else 0.0
+            return 0.0
+
+        @staticmethod
+        def _state_bonus(state: str, token: str) -> float:
+            if state == "ABSTRACT" and len(token) >= 7 and token not in PUNCT:
+                return 1.0
+            if state == "DESCRIBE" and content_word(token):
+                return 0.8
+            if state == "RELATE" and content_word(token):
+                return 0.4
+            if state == "REFLECT":
+                return 0.2
+            return 0.0
+
+        def _atoms(self, ctx: StepContext, tokens: List[str],
+                   logps: Dict[str, Tuple[int, float]]) -> np.ndarray:
+            frag = ctx.fragments
+            tape = ctx.tape
+            tail3 = tuple(tape[-3:])
+            grams4 = (ctx.corpus_ngrams or {}).get(4, set())
+            recent6 = set(tape[-6:])
+            rows = []
+
+            for token in tokens:
+                rank, logp = logps[token]
+                total, consistency = frag.score(tape, token, logp, rank, ctx.lam)
+                alignment = float(np.clip((total - logp) / 2.5 + 0.5, 0.0, 1.0))
+                delta = ctx.delta_fn(token)
+                cached = frag._cache.get(token)
+                ledger = (frag.ledger.bonus(frag.previous, cached)
+                          if cached is not None else 0.0)
+                four = 1.0 if (len(tail3) == 3 and tail3 + (token,) in grams4) else 0.0
+                rep = -1.0 if (content_word(token) and token in recent6) else 0.0
+
+                rows.append([
+                    logp,                                        # ngram
+                    ctx.lam * logp,                              # ramp
+                    alignment,                                   # alignment
+                    -consistency,                                # consistency
+                    ledger,                                      # ledger
+                    self._state_bonus(ctx.state, token),         # turing_state
+                    ctx.harm_fn(token),                          # harmonization
+                    self._association(ctx, token),               # association
+                    -delta,                                      # continuity
+                    four,                                        # corpus_4gram
+                    self._state_filter(ctx, token),              # state_filter
+                    -1.0 if consistency > ctx.tau else 0.0,      # tau_gate
+                    -1.0 if delta > ctx.epsilon else 0.0,        # epsilon_gate
+                    1.0 / (1.0 + rank),                          # rank_prior
+                    rep,                                         # repetition
+                ])
+            return np.asarray(rows, dtype=float)
+
+        def vote(self, ctx: StepContext) -> Tuple[Counter, List[str]]:
+            tokens: List[str] = []
+            logps: Dict[str, Tuple[int, float]] = {}
+            for rank, (token, logp) in enumerate(ctx.ranked):
+                if token not in logps:
+                    logps[token] = (rank, logp)
+                    tokens.append(token)
+            if not tokens:
+                return Counter(), []
+
+            atoms = self._atoms(ctx, tokens, logps)
+            mean = atoms.mean(axis=0)
+            std = atoms.std(axis=0)
+            safe = np.where(std > 1e-9, std, 1.0)
+            z = np.where(std > 1e-9, (atoms - mean) / safe, 0.0)
+
+            scores = z @ self.matrix.T                  # (candidates, masks)
+            winner_idx = scores.argmax(axis=0)          # ties -> best n-gram rank
+            winners = [tokens[i] for i in winner_idx]
+            return Counter(winners), winners
+
+
+# ---------------------------------------------------------------------------
+# Core model
+# ---------------------------------------------------------------------------
 
 @dataclass
 class Candidate:
@@ -938,10 +759,6 @@ class LockedFragments:
         self.previous = state
         self._cache.clear()
         return state
-
-
-def content_word(token: str) -> bool:
-    return len(token) > 3 and token not in PUNCT
 
 
 def harmonization_score(
@@ -1619,7 +1436,7 @@ def _read_one(path: Path) -> List[str]:
         body = rows[1:] if col is not None else rows
         return [r[col if col is not None else 0] for r in body
                 if r and len(r) > (col or 0)]
-    raise ValueError(f"Unsupported corpus file type: {path}")
+    return [path.read_text(encoding="utf-8-sig")]
 
 
 HF_PREFIX = "hf:"
@@ -1737,7 +1554,7 @@ def load_corpus(sources: Optional[Sequence[str]] = None) -> Tuple[str, List[str]
 
 
 # ---------------------------------------------------------------------------
-# Settings: edit here (no command-line arguments)
+# Settings: edit here, or use the GUI controls
 # ---------------------------------------------------------------------------
 
 CONFIG: Dict[str, Any] = {
@@ -1948,17 +1765,321 @@ def build_dataset(
 
 
 # ---------------------------------------------------------------------------
-# Interactive main (no arguments)
+# Gradio GUI
 # ---------------------------------------------------------------------------
 
-HELP = (
-    "Type a prompt to generate.  Commands:  :dataset  build a dataset with "
-    "CONFIG settings,  :matrix  save the function Gram matrix,  :trace  toggle "
-    "per-token trace,  :quit"
-)
+_LOCK = threading.Lock()  # stdout capture + shared CONFIG are not thread-safe
 
+SEGMENT_COLUMNS = [
+    "state", "end_state", "steps", "text", "natural_rate",
+    "novelty", "fallbacks", "relaxations", "closed", "mechanism_agreement",
+]
+
+
+def _paths(files: Any) -> List[str]:
+    """Normalise gr.File output across Gradio versions."""
+    if not files:
+        return []
+    if not isinstance(files, (list, tuple)):
+        files = [files]
+    return [str(getattr(f, "name", f)) for f in files]
+
+
+def _segments_df(segments: List[Dict[str, Any]]):
+    import pandas as pd
+    rows = []
+    for s in segments:
+        row = {k: s.get(k) for k in SEGMENT_COLUMNS}
+        for k in ("natural_rate", "novelty", "mechanism_agreement"):
+            if isinstance(row[k], float):
+                row[k] = round(row[k], 3)
+        rows.append(row)
+    return pd.DataFrame(rows, columns=SEGMENT_COLUMNS)
+
+
+def _gen_options(tokens, n_masks, beam, tau, epsilon, temperature, levels,
+                 ledger_weight, keep_learning, initial_state,
+                 template_associates) -> Dict[str, Any]:
+    return dict(
+        tokens=int(tokens),
+        n_masks=int(n_masks),
+        beam=int(beam),
+        tau=float(tau),
+        epsilon=float(epsilon),
+        temperature=float(temperature),
+        levels=int(levels),
+        ledger_weight=float(ledger_weight),
+        keep_learning=bool(keep_learning),
+        initial_state=str(initial_state),
+        template_associates=int(template_associates),
+    )
+
+
+def gui_load_engine(files, paths_text, pasted, order, alpha, warm_limit,
+                    hf_max, hf_stream):
+    sources = _paths(files)
+    sources += [p.strip() for p in (paths_text or "").split("|") if p.strip()]
+
+    try:
+        with _LOCK:
+            CONFIG["hf_max_samples"] = int(hf_max)
+            CONFIG["hf_streaming"] = bool(hf_stream)
+
+            texts: List[str] = []
+            used: List[str] = []
+            if sources:
+                text, used = load_corpus(sources)
+                texts.append(text)
+            if (pasted or "").strip():
+                texts.append(pasted.strip())
+                used.append("<pasted text>")
+            if not texts:
+                text, used = load_corpus(None)  # built-in corpus
+                texts.append(text)
+
+            engine = TextEngine(
+                corpus_text="\n\n".join(texts),
+                order=int(order),
+                alpha=float(alpha),
+                warm_limit=int(warm_limit),
+            )
+            engine.sources = used
+    except Exception as exc:  # noqa: BLE001
+        return None, f"❌ Could not load corpus: {exc}"
+
+    status = (
+        f"✅ Loaded **{len(engine.corpus_tokens):,}** tokens from "
+        f"**{len(used)}** source(s) · vocab {len(engine.model.vocab):,} · "
+        f"{len(engine.sentences):,} sentences\n\n"
+        + "\n".join(f"- `{u}`" for u in used[:20])
+        + ("\n- …" if len(used) > 20 else "")
+    )
+    return engine, status
+
+
+def gui_generate(engine, prompt, seed, trace, *opts):
+    import gradio as gr
+    if engine is None:
+        raise gr.Error("Load a corpus first (Corpus tab).")
+    options = _gen_options(*opts)
+    prompt = (prompt or "").strip() or CONFIG["default_prompt"]
+
+    buf = io.StringIO()
+    try:
+        with _LOCK, contextlib.redirect_stdout(buf):
+            result = engine.generate_text(
+                prompt, seed=int(seed), trace=bool(trace), **options)
+    except Exception as exc:  # noqa: BLE001
+        raise gr.Error(f"Generation failed: {exc}")
+
+    summary = {
+        k: result[k] for k in (
+            "prompt", "seed", "n_tokens", "n_segments", "mean_natural_rate",
+            "mean_novelty", "mean_agreement", "relaxations", "fallbacks",
+            "ledger")
+    }
+    return (
+        result["text"],
+        json.dumps(summary, indent=2, default=float),
+        _segments_df(result["segments"]),
+        buf.getvalue() or "(trace off)",
+    )
+
+
+def gui_dataset(engine, custom_prompts, n_prompts, n_seeds, base_seed, fmt,
+                include_segments, *opts):
+    import gradio as gr
+    import pandas as pd
+    if engine is None:
+        raise gr.Error("Load a corpus first (Corpus tab).")
+    options = _gen_options(*opts)
+
+    prompts = [p.strip() for p in (custom_prompts or "").splitlines() if p.strip()]
+    if not prompts:
+        prompts = engine.auto_prompts(int(n_prompts), int(base_seed))
+    seeds = [int(base_seed) + i for i in range(int(n_seeds))]
+
+    out_path = Path(tempfile.mkdtemp(prefix="dataset_")) / f"generated_dataset.{fmt}"
+
+    buf = io.StringIO()
+    try:
+        with _LOCK, contextlib.redirect_stdout(buf):
+            rows = build_dataset(
+                engine, prompts, seeds=seeds, out_path=str(out_path),
+                include_segments=bool(include_segments), progress=True,
+                **options)
+    except Exception as exc:  # noqa: BLE001
+        raise gr.Error(f"Dataset build failed: {exc}")
+
+    preview = pd.DataFrame([
+        {
+            "id": r["id"], "prompt": r["prompt"], "seed": r["seed"],
+            "n_tokens": r["n_tokens"], "n_segments": r["n_segments"],
+            "mean_novelty": round(r["mean_novelty"], 3),
+            "mean_agreement": (None if r["mean_agreement"] is None
+                               else round(r["mean_agreement"], 3)),
+            "text": r["text"],
+        }
+        for r in rows
+    ])
+    return str(out_path), preview, buf.getvalue()
+
+
+def gui_matrix():
+    import gradio as gr
+    import pandas as pd
+    try:
+        names, gram = function_inner_product_matrix(Path(__file__))
+    except Exception as exc:  # noqa: BLE001
+        raise gr.Error(f"Could not build matrix: {exc}")
+    out = Path(tempfile.mkdtemp(prefix="matrix_")) / "function_inner_product.csv"
+    save_function_inner_product_matrix(out, names, gram)
+    df = pd.DataFrame(gram, columns=names)
+    df.insert(0, "function", names)
+    return str(out), df, f"{len(names)} × {len(names)} Gram matrix"
+
+
+def build_ui():
+    try:
+        import gradio as gr
+        import pandas  # noqa: F401
+    except ImportError as exc:
+        raise SystemExit(
+            "Gradio is required. Install it with: python -m pip install gradio"
+        ) from exc
+
+    C = CONFIG
+    states = [s for s in TuringMachine.STATES if s != "HALT"]
+
+    with gr.Blocks(title="Turing Text Generator") as demo:
+        gr.Markdown(
+            "# Turing state-machine text generator\n"
+            f"Combinatoric-mechanism voting · I-II-III-O loop · "
+            f"mechanism: *{MECHANISM_SOURCE}*")
+        engine_state = gr.State(None)
+
+        # Generation settings are shared between the Generate and Dataset tabs.
+        with gr.Accordion("Generation settings", open=False):
+            with gr.Row():
+                tokens = gr.Slider(10, 2000, value=C["tokens"], step=10,
+                                   label="Tokens")
+                n_masks = gr.Number(value=C["n_masks"], precision=0,
+                                    minimum=1, maximum=32767,
+                                    label="Atom subsets voting (n_masks, max 32767)")
+                beam = gr.Slider(1, 64, value=C["beam"], step=1, label="Beam")
+            with gr.Row():
+                tau = gr.Slider(0, 1, value=C["tau"], step=0.01, label="tau")
+                epsilon = gr.Slider(0, 1, value=C["epsilon"], step=0.01,
+                                    label="epsilon")
+                temperature = gr.Slider(0, 2, value=C["temperature"], step=0.01,
+                                        label="Temperature")
+            with gr.Row():
+                levels = gr.Slider(2, 12, value=C["levels"], step=1,
+                                   label="Quantization levels")
+                ledger_weight = gr.Slider(0, 3, value=C["ledger_weight"],
+                                          step=0.05, label="Ledger weight")
+                template_associates = gr.Slider(
+                    1, 12, value=C["template_associates"], step=1,
+                    label="Template associates")
+            with gr.Row():
+                initial_state = gr.Dropdown(states, value=C["initial_state"],
+                                            label="Initial Turing state")
+                keep_learning = gr.Checkbox(
+                    value=C["keep_learning"],
+                    label="Keep learning (don't lock ledger)")
+        gen_inputs = [tokens, n_masks, beam, tau, epsilon, temperature, levels,
+                      ledger_weight, keep_learning, initial_state,
+                      template_associates]
+
+        with gr.Tabs():
+            # ------------------------------------------------------------ Corpus
+            with gr.Tab("1 · Corpus"):
+                gr.Markdown("Leave everything empty to use the built-in corpus.")
+                files = gr.File(
+                    label="Upload corpus files (.txt .md .rst .json .jsonl .csv)",
+                    file_count="multiple")
+                paths_text = gr.Textbox(
+                    label="Paths / Hugging Face specs (separate with |)",
+                    placeholder="my_folder | hf:wikitext:wikitext-2-raw-v1:train:text")
+                pasted = gr.Textbox(label="Or paste text", lines=5)
+                with gr.Row():
+                    order = gr.Slider(1, 8, value=C["order"], step=1,
+                                      label="n-gram order")
+                    alpha = gr.Slider(0.01, 2, value=C["alpha"], step=0.01,
+                                      label="Smoothing alpha")
+                    warm_limit = gr.Number(value=C["warm_limit"], precision=0,
+                                           label="Ledger warm-up tokens")
+                with gr.Row():
+                    hf_max = gr.Number(value=C["hf_max_samples"], precision=0,
+                                       label="HF max rows")
+                    hf_stream = gr.Checkbox(value=C["hf_streaming"],
+                                            label="HF streaming")
+                load_btn = gr.Button("Load corpus / train model", variant="primary")
+                status = gr.Markdown("_No corpus loaded yet._")
+                load_btn.click(
+                    gui_load_engine,
+                    [files, paths_text, pasted, order, alpha, warm_limit,
+                     hf_max, hf_stream],
+                    [engine_state, status])
+
+            # ---------------------------------------------------------- Generate
+            with gr.Tab("2 · Generate"):
+                with gr.Row():
+                    prompt = gr.Textbox(label="Prompt", value=C["default_prompt"],
+                                        scale=4)
+                    seed = gr.Number(value=C["seed"], precision=0, label="Seed",
+                                     scale=1)
+                    trace = gr.Checkbox(value=False, label="Per-token trace",
+                                        scale=1)
+                gen_btn = gr.Button("Generate", variant="primary")
+                out_text = gr.Textbox(label="Generated text", lines=12)
+                with gr.Row():
+                    out_summary = gr.Code(label="Run summary", language="json")
+                    out_trace = gr.Textbox(label="Trace", lines=12)
+                out_segments = gr.Dataframe(label="Segments", wrap=True)
+                gen_args = [engine_state, prompt, seed, trace, *gen_inputs]
+                gen_outs = [out_text, out_summary, out_segments, out_trace]
+                gen_btn.click(gui_generate, gen_args, gen_outs)
+                prompt.submit(gui_generate, gen_args, gen_outs)
+
+            # ----------------------------------------------------------- Dataset
+            with gr.Tab("3 · Dataset"):
+                custom_prompts = gr.Textbox(
+                    label="Prompts (one per line; leave blank to draw them "
+                          "from the corpus)", lines=5)
+                with gr.Row():
+                    n_prompts = gr.Slider(1, 500, value=C["dataset_prompts"],
+                                          step=1, label="Auto prompts")
+                    n_seeds = gr.Slider(1, 20, value=C["dataset_seeds"], step=1,
+                                        label="Samples per prompt")
+                    base_seed = gr.Number(value=C["seed"], precision=0,
+                                          label="Base seed")
+                with gr.Row():
+                    fmt = gr.Radio(["jsonl", "csv"], value="jsonl", label="Format")
+                    include_segments = gr.Checkbox(
+                        value=True, label="Include segments (JSONL only)")
+                ds_btn = gr.Button("Build dataset", variant="primary")
+                ds_file = gr.File(label="Download dataset")
+                ds_preview = gr.Dataframe(label="Preview", wrap=True)
+                ds_log = gr.Textbox(label="Progress log", lines=6)
+                ds_btn.click(
+                    gui_dataset,
+                    [engine_state, custom_prompts, n_prompts, n_seeds,
+                     base_seed, fmt, include_segments, *gen_inputs],
+                    [ds_file, ds_preview, ds_log])
+
+            # ------------------------------------------------------------ Matrix
+            with gr.Tab("4 · Function Gram matrix"):
+                gr.Markdown("Identity-aware inner-product matrix of every "
+                            "function/method in this file.")
+                mx_btn = gr.Button("Compute matrix")
+                mx_info = gr.Markdown()
+                mx_file = gr.File(label="Download CSV")
+                mx_df = gr.Dataframe(label="Matrix", wrap=False)
+                mx_btn.click(gui_matrix, None, [mx_file, mx_df, mx_info])
+
+    return demo
 
 
 if __name__ == "__main__":
     build_ui().queue().launch()
-
