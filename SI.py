@@ -23,17 +23,22 @@ otherwise the built-in implementation below is used.
   I Identity -> II Correspondence -> III Verification -> O Recycling
   M_{t+1} = O(III(II(I(M_t))))        I_{t+1} = O_t
 
-API:  load_corpus, TextEngine, generate_text, build_dataset
+API:  load_corpus, TextEngine, generate_text, build_dataset,
+      save_engine, load_engine
 """
 
 from __future__ import annotations
 
 import ast
+import builtins
 import contextlib
 import csv
+import gzip
 import io
 import json
 import math
+import os
+import pickle
 import random
 import re
 import sys
@@ -50,11 +55,6 @@ except ImportError as exc:
     raise SystemExit(
         "NumPy is required. Install it with: python -m pip install numpy"
     ) from exc
-
-try:
-    from __main__ import __file__ as _main_file  # noqa: F401
-except Exception:  # pragma: no cover
-    pass
 
 TOKEN_RE = re.compile(
     r"[A-Za-z]+(?:['’][A-Za-z]+)*|\d+(?:\.\d+)?|[^\w\s]",
@@ -1436,7 +1436,7 @@ def _read_one(path: Path) -> List[str]:
         body = rows[1:] if col is not None else rows
         return [r[col if col is not None else 0] for r in body
                 if r and len(r) > (col or 0)]
-    return [path.read_text(encoding="utf-8-sig")]
+    raise ValueError(f"Unsupported corpus file type: {path}")
 
 
 HF_PREFIX = "hf:"
@@ -1604,21 +1604,77 @@ class TextEngine:
         else:
             self.corpus_text, self.sources = load_corpus(corpus)
 
+        self.warm_limit = int(warm_limit)
+        self.model = NGramModel(order=order, alpha=alpha)
         self.corpus_tokens = tokenize(self.corpus_text)
         if not self.corpus_tokens:
             raise ValueError("Corpus contains no recognizable tokens.")
 
-        self.model = NGramModel(order=order, alpha=alpha)
         self.model.train(self.corpus_text)
-        self.associations = build_associations(self.model)
-        self.warm_tokens = self.corpus_tokens[:max(0, warm_limit)] or None
+        self._derive()
 
+    def _derive(self) -> None:
+        """Rebuild everything that follows from the trained model + corpus text."""
+        self.corpus_tokens = tokenize(self.corpus_text)
+        self.associations = build_associations(self.model)
+        self.warm_tokens = self.corpus_tokens[:max(0, self.warm_limit)] or None
         self.sentences = [
             tokenize(s)
             for s in re.split(r"(?<=[.!?])\s+", self.corpus_text.strip())
             if s.strip()
         ]
         self.corpus_ngrams = build_corpus_ngrams(self.sentences)
+
+    # -- persistence ---------------------------------------------------------
+    def to_state(self) -> Dict[str, Any]:
+        """Plain-data snapshot (dicts/lists/tuples/strings/numbers only)."""
+        return {
+            "format": MODEL_FORMAT,
+            "version": MODEL_VERSION,
+            "order": self.model.order,
+            "alpha": self.model.alpha,
+            "total_tokens": self.model.total_tokens,
+            "vocab": dict(self.model.vocab),
+            "counts": [
+                {ctx: dict(targets) for ctx, targets in level.items()}
+                for level in self.model.counts
+            ],
+            "corpus_text": self.corpus_text,
+            "sources": list(self.sources),
+            "warm_limit": self.warm_limit,
+        }
+
+    @classmethod
+    def from_state(cls, state: Dict[str, Any]) -> "TextEngine":
+        if not isinstance(state, dict) or state.get("format") != MODEL_FORMAT:
+            raise ValueError("Not a Turing text-engine model file.")
+        if state.get("version") != MODEL_VERSION:
+            raise ValueError(
+                f"Unsupported model version {state.get('version')!r} "
+                f"(this build reads version {MODEL_VERSION}).")
+        order = int(state["order"])
+        counts = state["counts"]
+        if len(counts) != order:
+            raise ValueError("Corrupt model file: n-gram order mismatch.")
+
+        engine = cls.__new__(cls)
+        engine.corpus_text = str(state["corpus_text"])
+        engine.sources = [str(x) for x in state.get("sources", [])]
+        engine.warm_limit = int(state.get("warm_limit", 20000))
+
+        model = NGramModel(order=order, alpha=float(state["alpha"]))
+        model.counts = [
+            defaultdict(Counter, {tuple(ctx): Counter(targets)
+                                  for ctx, targets in level.items()})
+            for level in counts
+        ]
+        model.vocab = Counter(state["vocab"])
+        model.total_tokens = int(state["total_tokens"])
+        engine.model = model
+        engine._derive()
+        if not engine.corpus_tokens:
+            raise ValueError("Corrupt model file: empty corpus.")
+        return engine
 
     def generate_text(
         self,
@@ -1690,6 +1746,47 @@ class TextEngine:
             if len(out) >= n:
                 break
         return out or ["A process"]
+
+
+MODEL_FORMAT = "turing-text-engine"
+MODEL_VERSION = 1
+MODEL_SUFFIX = ".tengine"
+
+
+class _SafeUnpickler(pickle.Unpickler):
+    """Only plain data may be loaded: no classes or callables except set types."""
+
+    def find_class(self, module: str, name: str) -> Any:
+        if module == "builtins" and name in {"set", "frozenset"}:
+            return getattr(builtins, name)
+        raise pickle.UnpicklingError(
+            f"Blocked unsafe object in model file: {module}.{name}")
+
+
+def save_engine(engine: TextEngine, path: Any) -> Path:
+    """Save a trained engine (gzip-compressed). Writes atomically."""
+    target = Path(path)
+    if not target.suffix:
+        target = target.with_suffix(MODEL_SUFFIX)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_name(target.name + ".tmp")
+    with gzip.open(tmp, "wb", compresslevel=6) as handle:
+        pickle.dump(engine.to_state(), handle, protocol=4)
+    os.replace(tmp, target)
+    return target
+
+
+def load_engine(path: Any) -> TextEngine:
+    """Load an engine saved by save_engine (restricted, data-only unpickling)."""
+    source = Path(path)
+    if not source.is_file():
+        raise FileNotFoundError(f"Model file not found: {source}")
+    try:
+        with gzip.open(source, "rb") as handle:
+            state = _SafeUnpickler(handle).load()
+    except (OSError, EOFError, pickle.UnpicklingError) as exc:
+        raise ValueError(f"Could not read model file: {exc}") from exc
+    return TextEngine.from_state(state)
 
 
 _ENGINES: Dict[Tuple, TextEngine] = {}
@@ -1925,6 +2022,45 @@ def gui_dataset(engine, custom_prompts, n_prompts, n_seeds, base_seed, fmt,
     return str(out_path), preview, buf.getvalue()
 
 
+def gui_save_model(engine, filename, disk_path):
+    import gradio as gr
+    if engine is None:
+        raise gr.Error("Nothing to save: load or train a corpus first.")
+    name = Path((filename or "model").strip() or "model").name
+    if not name.endswith(MODEL_SUFFIX):
+        name += MODEL_SUFFIX
+    out = Path(tempfile.mkdtemp(prefix="model_")) / name
+    try:
+        with _LOCK:
+            save_engine(engine, out)
+            msg = f"✅ Saved `{name}` ({out.stat().st_size / 1e6:.2f} MB)."
+            if (disk_path or "").strip():
+                dest = save_engine(engine, disk_path.strip())
+                msg += f"\n\nAlso written to `{dest}`."
+    except Exception as exc:  # noqa: BLE001
+        raise gr.Error(f"Save failed: {exc}")
+    return str(out), msg
+
+
+def gui_load_model(engine, upload, disk_path):
+    paths = _paths(upload)
+    chosen = (disk_path or "").strip() or (paths[0] if paths else "")
+    if not chosen:
+        return engine, "⚠️ Upload a model file or enter a path."
+    try:
+        with _LOCK:
+            loaded = load_engine(chosen)
+    except Exception as exc:  # noqa: BLE001
+        return engine, f"❌ Could not load model: {exc}"
+    m = loaded.model
+    return loaded, (
+        f"✅ Model loaded · n-gram order {m.order} · alpha {m.alpha} · "
+        f"{len(loaded.corpus_tokens):,} tokens · vocab {len(m.vocab):,} · "
+        f"{len(loaded.sentences):,} sentences\n\n"
+        "Go to **Generate**. (The n-gram order and alpha are taken from the "
+        "file, not from the Corpus tab.)")
+
+
 def gui_matrix():
     import gradio as gr
     import pandas as pd
@@ -2067,6 +2203,42 @@ def build_ui():
                     [engine_state, custom_prompts, n_prompts, n_seeds,
                      base_seed, fmt, include_segments, *gen_inputs],
                     [ds_file, ds_preview, ds_log])
+
+            # --------------------------------------------------------- Save/Load
+            with gr.Tab("5 · Save / Load model"):
+                gr.Markdown(
+                    "Save the trained model (n-gram counts + corpus) so you "
+                    "can skip retraining next time. Files are gzip-compressed "
+                    "plain data and are loaded with a restricted reader that "
+                    "refuses code objects.")
+                with gr.Row():
+                    with gr.Column():
+                        gr.Markdown("### Save")
+                        save_name = gr.Textbox(label="File name",
+                                               value="model.tengine")
+                        save_path = gr.Textbox(
+                            label="Also write to this path on disk (optional)",
+                            placeholder="models/my_model.tengine")
+                        save_btn = gr.Button("Save model", variant="primary")
+                        save_file = gr.File(label="Download model")
+                        save_msg = gr.Markdown()
+                    with gr.Column():
+                        gr.Markdown("### Load")
+                        load_file = gr.File(label="Upload a .tengine file",
+                                            file_count="single")
+                        load_path = gr.Textbox(
+                            label="Or load from a path on disk "
+                                  "(overrides the upload)",
+                            placeholder="models/my_model.tengine")
+                        load_model_btn = gr.Button("Load model",
+                                                   variant="primary")
+                        load_msg = gr.Markdown()
+                save_btn.click(gui_save_model,
+                               [engine_state, save_name, save_path],
+                               [save_file, save_msg])
+                load_model_btn.click(gui_load_model,
+                                     [engine_state, load_file, load_path],
+                                     [engine_state, load_msg])
 
             # ------------------------------------------------------------ Matrix
             with gr.Tab("4 · Function Gram matrix"):
