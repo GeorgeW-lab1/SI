@@ -1436,7 +1436,7 @@ def _read_one(path: Path) -> List[str]:
         body = rows[1:] if col is not None else rows
         return [r[col if col is not None else 0] for r in body
                 if r and len(r) > (col or 0)]
-    raise ValueError(f"Unsupported corpus file type: {path}")
+    return [path.read_text(encoding="utf-8-sig")]
 
 
 HF_PREFIX = "hf:"
