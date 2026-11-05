@@ -1,44 +1,25 @@
 #!/usr/bin/env python3
 """
-Turing state-machine text generator with an ad-hoc association template
-=======================================================================
+Turing state-machine text generator driven by a combinatoric mechanism
+======================================================================
 
-The generate() function:
+Run it:   python discrete_lock_turing.py        (no arguments; it asks you)
+Settings: edit CONFIG near the bottom of this file.
 
-1. Tokenizes the prompt.
-2. Extracts prompt content words.
-3. Builds a symmetric association table directly from corpus bigrams.
-4. Constructs an ad-hoc template such as:
+Every generated token is elected by the combinatoric mechanism
+(combinatoric_mechanism.py): the generator's algorithms are split into atoms
+(n-gram probability, adiabatic ramp, fragment alignment/consistency, ledger,
+Turing-state bonus, harmonization, association affinity, continuity delta,
+corpus 4-grams, the state filters, the tau/epsilon gates) and a few hundred
+subsets of those atoms each vote for a token at every step.  The votes are the
+token distribution.
 
-       A process is <ASSOC> and <ASSOC>
+The I-II-III-O loop, Turing states, ledger and fragments are unchanged:
 
-5. Fills each <ASSOC> slot from the strongest corpus associates.
-6. Uses the filled template as the initial Turing-machine tape.
-7. Continues generation using explicit Turing states, one token at a time,
-   through the recursive I-II-III-O memory loop.
+  I Identity -> II Correspondence -> III Verification -> O Recycling
+  M_{t+1} = O(III(II(I(M_t))))        I_{t+1} = O_t
 
-The recursive memory loop (the "I-II-III-O Protocol")
------------------------------------------------------
-  I    Identity        recognise the current state: rank next-token candidates
-                       (the Turing state's hard constraints apply here)
-  II   Correspondence  signal between context and candidate (fragment score,
-                       ledger bonus, Turing-state bonuses)
-  III  Verification    continuity check  Delta(M_t, M_{t+1}) <= epsilon
-  O    Recycling       reintegrate the chosen token: write it to the tape,
-                       fold it into memory, advance the Turing machine
-
-      M_{t+1} = O(III(II(I(M_t))))        I_{t+1} = O_t
-
-M_t is a unit vector: the exponentially decayed sum of hashed token features
-of everything on the tape. Delta is half the Euclidean distance between
-consecutive unit states (0..1). Over-strict enforcement would classify
-ordinary variation as error, so epsilon is relaxed geometrically whenever no
-candidate passes, rather than rejecting everything.
-
-Usage:
-  python discrete_lock_turing.py corpus.txt --prompt "once upon a" --tokens 200 --trace
-  python discrete_lock_turing.py --prompt "The machine" --tokens 120 --epsilon 0.4
-  python discrete_lock_turing.py --interactive
+API:  load_corpus, TextEngine, generate_text, build_dataset
 """
 
 from __future__ import annotations
@@ -50,10 +31,11 @@ import json
 import math
 import random
 import re
+import sys
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 try:
     import numpy as np
@@ -61,6 +43,9 @@ except ImportError as exc:
     raise SystemExit(
         "NumPy is required. Install it with: python -m pip install numpy"
     ) from exc
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from combinatoric_mechanism import MechanismCombinator, StepContext  # noqa: E402
 
 
 TOKEN_RE = re.compile(
@@ -249,22 +234,12 @@ class TuringTransition:
     """
     One Turing-machine transition rule.
 
-    state:
-      The control state in which this rule is active. (Previously missing, so
-      every rule fired in every state and the machine never advanced.)
-
-    read:
-      "*" matches any symbol class; otherwise END, PUNCT, LONG, MEDIUM,
-      SHORT or BLANK.
-
-    write:
-      A literal token to append, or None to append the sampled candidate.
-
-    move:
-      Head movement: -1, 0, or +1.
-
-    min_steps / max_steps:
-      Bounds on the number of steps already spent IN `state`.
+    state:     control state in which this rule is active.
+    read:      "*" matches any symbol class; otherwise END, PUNCT, LONG,
+               MEDIUM, SHORT or BLANK.
+    write:     literal token to append, or None to append the sampled candidate.
+    move:      head movement: -1, 0, or +1.
+    min_steps / max_steps: bounds on steps already spent IN `state`.
     """
 
     state: str
@@ -632,16 +607,14 @@ def harmonization_score(
     strength: float = 0.75,
 ) -> float:
     """
-    Apply a small context-sensitive score adjustment to equation-like text.
+    Small context-sensitive score adjustment for equation-like text.
 
     If a recent context looks like an equation and contains the letter ``i``
-    without the digit ``1``, prefer ``1`` over ``i`` as the next token. This is
-    only a heuristic for token selection; it does not prove or solve algebra,
-    and it deliberately does not rewrite the existing tape.
+    without the digit ``1``, prefer ``1`` over ``i``. It is a token-selection
+    heuristic only; it does not rewrite the existing tape.
 
     Exemption: when the context contains the I-II-III-O protocol symbols
-    (II / III), "I" is the stage name Identity, not a mistyped 1, so no
-    adjustment is made.
+    (II / III), "I" is the stage name Identity, not a mistyped 1.
     """
     recent = list(context[-16:])
     if not recent:
@@ -816,10 +789,9 @@ def function_inner_product_matrix(source_path: Optional[Path] = None) -> Tuple[L
     """Build an identity-aware Gram matrix for every function/method in source.
 
     Each function vector combines AST structure, normalized function-call names,
-    and canonical return-expression identities. The identity component recognizes
-    limited forms such as ``x + y`` versus ``y + x`` and parameter renaming.
-    G = X @ X.T is an inner-product matrix. It measures shared features and
-    recognized syntactic identities; it does not prove arbitrary functions equal.
+    and canonical return-expression identities. G = X @ X.T measures shared
+    features and recognized syntactic identities; it does not prove arbitrary
+    functions equal.
     """
     path = source_path or Path(__file__)
     source = path.read_text(encoding="utf-8")
@@ -904,26 +876,24 @@ def generate(
     template_associates: int = 4,
     epsilon: float = 0.6,
     corpus_ngrams: Optional[Dict[int, Set[Tuple[str, ...]]]] = None,
+    combinator: Optional[MechanismCombinator] = None,
+    base_associations: Optional[Dict[str, Counter]] = None,
 ) -> Tuple[str, List[Dict[str, object]], TransitionLedger]:
     """
-    Generate text using an ad-hoc template constructed from prompt
-    associations, continued by a Turing machine through the I-II-III-O loop.
+    Generate text from an association template, continued by a Turing machine
+    through the I-II-III-O loop. Each token is elected by the combinatoric
+    mechanism (a vote over sampled subsets of the algorithm atoms).
     """
+    return _generate(
+        model, prompt, token_count, beam_size, tau, temperature, seed,
+        show_trace, levels, ledger_weight, warm_tokens, lock_ledger,
+        initial_state, template_associates, epsilon, corpus_ngrams,
+        combinator, base_associations,
+    )
 
-    rng = random.Random(seed)
-    ledger = TransitionLedger()
-    fragments = LockedFragments(seed, ledger, levels, ledger_weight)
 
-    # -------------------------------------------------------------
-    # Prompt tools.
-    # -------------------------------------------------------------
-    prompt_tokens = tokenize(prompt) or ["The"]
-    prompt_content = [t for t in prompt_tokens if content_word(t)]
-
-    # -------------------------------------------------------------
-    # Build a symmetric association table from corpus bigrams.
-    # Punctuation and padding are never associates.
-    # -------------------------------------------------------------
+def build_associations(model: NGramModel) -> Dict[str, Counter]:
+    """Symmetric association table from corpus bigrams (no punctuation/padding)."""
     associations: Dict[str, Counter] = defaultdict(Counter)
 
     for context, targets in model.counts[1].items():
@@ -941,8 +911,34 @@ def generate(
                 associations[source][target] += count
                 associations[target][source] += count
 
+    return associations
+
+
+def _generate(
+    model, prompt, token_count, beam_size, tau, temperature, seed,
+    show_trace, levels, ledger_weight, warm_tokens, lock_ledger,
+    initial_state, template_associates, epsilon, corpus_ngrams,
+    combinator, base_associations,
+):
+    rng = random.Random(seed)
+    ledger = TransitionLedger()
+    fragments = LockedFragments(seed, ledger, levels, ledger_weight)
+
+    # -------------------------------------------------------------
+    # Prompt tools.
+    # -------------------------------------------------------------
+    prompt_tokens = tokenize(prompt) or ["The"]
+    prompt_content = [t for t in prompt_tokens if content_word(t)]
+
+    # -------------------------------------------------------------
+    # Association table (shared, read-only).
+    # -------------------------------------------------------------
+    associations = (
+        base_associations if base_associations is not None
+        else build_associations(model)
+    )
+
     def top_associates(word: str, k: int) -> List[str]:
-        # Try the word as written, then lowercase / capitalised variants.
         for variant in (word, word.lower(), word.capitalize()):
             counts = associations.get(variant)
             if counts:
@@ -950,9 +946,7 @@ def generate(
         return []
 
     # -------------------------------------------------------------
-    # Construct and fill the ad-hoc template:
-    #   A process is <ASSOC> and <ASSOC>
-    # A slot with no associates is dropped rather than echoing the prompt.
+    # Ad-hoc template:  A process is <ASSOC> and <ASSOC>
     # -------------------------------------------------------------
     tape: List[str] = list(prompt_tokens)
     filled_slots = 0
@@ -1008,7 +1002,6 @@ def generate(
 
     # -------------------------------------------------------------
     # Turing-controlled continuation: the I-II-III-O loop.
-    # I_0 is the filled template, folded into the recursive memory.
     # -------------------------------------------------------------
     machine = TuringMachine(initial_state)
 
@@ -1016,6 +1009,7 @@ def generate(
     produced = len(tape)
     raw = _fold_all(tape)
     total_relaxations = 0
+    n_masks = len(combinator.masks) if combinator is not None else 1
 
     while produced < token_count:
         emitted: List[str] = []
@@ -1024,6 +1018,7 @@ def generate(
         closed = False
         start_step = produced
         segment_state = machine.state
+        agreement: List[float] = []
 
         for local in range(max(1, token_count - produced)):
             lam = adiabatic_lambda(start_step + local, max(1, token_count))
@@ -1114,9 +1109,24 @@ def generate(
                               delta=delta)
                 ]
 
+            # ---- Combinatoric mechanism: every atom subset votes -----------
+            combo_votes: Counter = Counter()
+
+            if combinator is not None:
+                ctx = StepContext(
+                    tape=tape, ranked=ranked, state=state, lam=lam,
+                    fragments=fragments,
+                    delta_fn=lambda tok, _m=m_t, _r=raw: continuity_delta(
+                        _m, _unit_state(_fold(_r, tok))),
+                    harm_fn=lambda tok: harmonization_score(tape, tok, 0.75),
+                    associations=associations, anchors=prompt_content,
+                    corpus_ngrams=corpus_ngrams, tau=tau, epsilon=epsilon,
+                )
+                combo_votes, _winners = combinator.vote(ctx)
+                if combo_votes:
+                    agreement.append(max(combo_votes.values()) / n_masks)
+
             # ---- Stage III: Verification (Delta <= epsilon) ---------------
-            # Relax epsilon instead of rejecting everything, so ordinary
-            # variation is not misclassified as an error.
             eps_eff = max(1e-6, epsilon)
             verified = [c for c in scored if c.delta <= eps_eff]
             while not verified and eps_eff < 1.0:
@@ -1125,6 +1135,16 @@ def generate(
                 verified = [c for c in scored if c.delta <= eps_eff]
             if not verified:
                 verified = [min(scored, key=lambda c: c.delta)]
+
+            # The vote is the distribution: tokens elected by more mechanisms
+            # are proportionally more likely. The classic score only breaks ties.
+            if combo_votes:
+                voted = [c for c in verified if combo_votes.get(c.token, 0) > 0]
+                if voted:
+                    verified = voted
+                for c in verified:
+                    c.score = (math.log1p(combo_votes.get(c.token, 0))
+                               + 0.01 * c.score)
 
             verified.sort(key=lambda c: c.score, reverse=True)
             beam = verified[:max(1, beam_size)]
@@ -1153,7 +1173,8 @@ def generate(
                     f"p={math.exp(chosen.base_logp):.2f} "
                     f"score={chosen.score:+.3f} "
                     f"D={chosen.consistency:.3f} "
-                    f"delta={chosen.delta:.3f}"
+                    f"delta={chosen.delta:.3f} "
+                    f"votes={combo_votes.get(chosen.token, 0)}/{n_masks}"
                 )
 
             next_state = machine.step(tape, chosen.token)
@@ -1162,8 +1183,7 @@ def generate(
                 closed = chosen.token in END
                 break
 
-        # Close an unfinished segment. The tape is edited too, so segment
-        # text and tape always agree.
+        # Close an unfinished segment (tape edited too, so they agree).
         if emitted and emitted[-1] not in END:
             if emitted[-1] in PUNCT:
                 emitted[-1] = "."
@@ -1194,6 +1214,9 @@ def generate(
                 "fallbacks": fallbacks,
                 "relaxations": relaxations,
                 "closed": closed,
+                "mechanism_agreement": (
+                    float(np.mean(agreement)) if agreement else None
+                ),
             }
         )
 
@@ -1206,164 +1229,357 @@ def generate(
     return detokenize(tape), segments, ledger
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description=(
-            "Turing state-machine text generator using an ad-hoc "
-            "association template and the I-II-III-O memory loop."
-        )
-    )
+# ---------------------------------------------------------------------------
+# Dataset layer: corpus loading -> engine -> generated-sample dataset
+# ---------------------------------------------------------------------------
 
-    parser.add_argument(
-        "corpus",
-        nargs="?",
-        help="UTF-8 corpus file; omit to use the built-in corpus.",
-    )
-    parser.add_argument("--prompt", default="A process")
-    parser.add_argument(
-        "--interactive",
-        action="store_true",
-        help="Read prompts from stdin repeatedly (blank line or EOF quits).",
-    )
-    parser.add_argument("--tokens", type=int, default=500)
-    parser.add_argument("--order", type=int, default=5)
-    parser.add_argument("--alpha", type=float, default=0.25)
-    parser.add_argument("--beam", type=int, default=12)
-    parser.add_argument("--tau", type=float, default=0.95)
-    parser.add_argument(
-        "--epsilon",
-        type=float,
-        default=0.6,
-        help="Max continuity deviation Delta(M_t, M_t+1) per token (0..1); "
-             "relaxed automatically if nothing passes.",
-    )
-    parser.add_argument("--temperature", type=float, default=0.85)
-    parser.add_argument("--seed", type=int, default=7)
-    parser.add_argument(
-        "--initial-state",
-        default="OBSERVE",
-        choices=TuringMachine.STATES,
-    )
-    parser.add_argument("--levels", type=int, default=5)
-    parser.add_argument("--ledger-weight", type=float, default=0.9)
-    parser.add_argument("--warm-limit", type=int, default=20000)
-    parser.add_argument(
-        "--keep-learning",
-        action="store_true",
-        help="Keep the transition ledger mutable during generation.",
-    )
-    parser.add_argument(
-        "--template-associates",
-        type=int,
-        default=4,
-        help="Number of associates considered for each template slot.",
-    )
-    parser.add_argument(
-        "--trace",
-        action="store_true",
-        help="Print the template and per-token generation trace.",
-    )
-    parser.add_argument("--save", help="Write the generated text to this file.")
-    parser.add_argument("--segments-json", help="Write segment statistics to this JSON file.")
-    parser.add_argument(
-        "--function-matrix",
-        nargs="?",
-        const="function_inner_product.csv",
-        help="Write the inner-product (Gram) matrix of all functions/methods to CSV; optionally provide a path.",
-    )
-    parser.add_argument(
-        "--show-function-matrix",
-        action="store_true",
-        help="Print the labelled function inner-product matrix before generation.",
-    )
+TEXT_SUFFIXES = {".txt", ".md", ".text", ".rst"}
+TABLE_SUFFIXES = {".json", ".jsonl", ".csv"}
+TEXT_FIELDS = ("text", "content", "body", "sentence", "document")
 
-    args = parser.parse_args()
 
-    corpus_path = Path(input("Filename: "))
+def _texts_from_json(obj: Any) -> Iterable[str]:
+    if isinstance(obj, str):
+        yield obj
+    elif isinstance(obj, dict):
+        for field in TEXT_FIELDS:
+            if isinstance(obj.get(field), str):
+                yield obj[field]
+                return
+        for value in obj.values():
+            yield from _texts_from_json(value)
+    elif isinstance(obj, list):
+        for item in obj:
+            yield from _texts_from_json(item)
 
- 
 
-    try:
-        corpus_text = corpus_path.read_text(encoding="utf-8-sig")
-    except UnicodeDecodeError as exc:
-        parser.error(f"Could not decode corpus as UTF-8: {exc}")
+def _read_one(path: Path) -> List[str]:
+    suffix = path.suffix.lower()
     
+    if suffix == ".jsonl":
+        out: List[str] = []
+        for line in path.read_text(encoding="utf-8-sig").splitlines():
+            line = line.strip()
+            if line:
+                out.extend(_texts_from_json(json.loads(line)))
+        return out
+    if suffix == ".json":
+        return list(_texts_from_json(json.loads(path.read_text(encoding="utf-8-sig"))))
+    if suffix == ".csv":
+        with path.open(newline="", encoding="utf-8-sig") as handle:
+            rows = list(csv.reader(handle))
+        if not rows:
+            return []
+        header = [h.strip().lower() for h in rows[0]]
+        col = next((header.index(f) for f in TEXT_FIELDS if f in header), None)
+        body = rows[1:] if col is not None else rows
+        return [r[col if col is not None else 0] for r in body
+                if r and len(r) > (col or 0)]
+    return [path.read_text(encoding="utf-8-sig")]
 
-    corpus_tokens = tokenize(corpus_text)
+def load_corpus(sources: Optional[Sequence[str]] = None) -> Tuple[str, List[str]]:
+    """Read files/directories into one training text. None -> built-in corpus.
 
-    if not corpus_tokens:
-        parser.error("Corpus contains no recognizable tokens.")
+    Accepts .txt/.md/.rst, .json/.jsonl (a text/content/body field, or any
+    strings) and .csv (a text-like column, else the first column).
+    """
+    if not sources:
+        return BUILTIN_CORPUS, ["<builtin>"]
 
-    model = NGramModel(order=args.order, alpha=args.alpha)
-    model.train(corpus_text)
+    texts: List[str] = []
+    used: List[str] = []
+    for source in sources:
+        path = Path(source)
+        if path.is_dir():
+            files = sorted(p for p in path.rglob("*")
+                           if p.suffix.lower() in TEXT_SUFFIXES | TABLE_SUFFIXES)
+        elif path.exists():
+            files = [path]
+        else:
+            raise FileNotFoundError(f"Corpus source not found: {source}")
+        for file in files:
+            try:
+                chunk = [t.strip() for t in _read_one(file) if t and t.strip()]
+            except UnicodeDecodeError as exc:
+                raise ValueError(f"Could not decode {file} as UTF-8: {exc}") from exc
+            if chunk:
+                texts.extend(chunk)
+                used.append(str(file))
 
-    # Corpus n-grams for the novelty statistic (built once, from the corpus
-    # itself rather than from the generated tape).
-    corpus_sentences = [
-        tokenize(s)
-        for s in re.split(r"(?<=[.!?])\s+", corpus_text.strip())
-        if s.strip()
-    ]
-    corpus_ngrams = build_corpus_ngrams(corpus_sentences)
+    if not texts:
+        raise ValueError("No usable text found in the corpus sources.")
+    return "\n\n".join(texts), used
 
-    if args.function_matrix or args.show_function_matrix:
-        try:
-            function_names, gram_matrix = function_inner_product_matrix(Path(__file__))
-        except (OSError, SyntaxError) as exc:
-            parser.error(f"Could not construct function inner-product matrix: {exc}")
 
-        if args.function_matrix:
-            matrix_path = Path(args.function_matrix)
-            save_function_inner_product_matrix(matrix_path, function_names, gram_matrix)
-            print(f"[function-matrix] saved {len(function_names)} x {len(function_names)} matrix to {matrix_path}")
+# ---------------------------------------------------------------------------
+# Settings: edit here (no command-line arguments)
+# ---------------------------------------------------------------------------
 
-        if args.show_function_matrix:
-            print("\n--- IDENTITY-AWARE FUNCTION INNER-PRODUCT MATRIX ---")
-            print("Functions:", " | ".join(function_names))
-            np.set_printoptions(precision=1, suppress=True, linewidth=180)
-            print(gram_matrix)
+CONFIG: Dict[str, Any] = {
+    "order": 5,                 # n-gram order
+    "alpha": 0.25,              # n-gram smoothing
+    "warm_limit": 20000,        # corpus tokens used to warm the ledger
+    "tokens": 200,              # tokens per generation
+    "seed": 7,
+    "n_masks": 512,             # atom subsets voting at every step (max 32,767)
+    "beam": 12,
+    "tau": 0.95,
+    "epsilon": 0.6,
+    "temperature": 0.85,
+    "levels": 5,
+    "ledger_weight": 0.9,
+    "keep_learning": False,
+    "initial_state": "OBSERVE",
+    "template_associates": 4,
+    "trace": False,
+    "default_prompt": "A process",
+    "dataset_out": "generated_dataset.jsonl",   # .jsonl or .csv
+    "dataset_prompts": 25,      # prompts drawn from the corpus
+    "dataset_seeds": 2,         # samples per prompt
+}
 
-    def run(prompt: str) -> None:
-        text, segments, _ledger = generate(
-            model,
-            input("Prompt> "),
-            token_count=max(1, args.tokens),
-            beam_size=max(1, args.beam),
-            tau=float(np.clip(args.tau, 0.0, 1.0)),
-            temperature=max(0.0, args.temperature),
-            seed=args.seed,
-            show_trace=args.trace,
-            levels=args.levels,
-            ledger_weight=args.ledger_weight,
-            warm_tokens=(
-                corpus_tokens[:max(0, args.warm_limit)]
-                if args.warm_limit > 0
-                else None
-            ),
-            lock_ledger=not args.keep_learning,
-            initial_state=args.initial_state,
-            template_associates=max(1, args.template_associates),
-            epsilon=float(np.clip(args.epsilon, 0.0, 1.0)),
-            corpus_ngrams=corpus_ngrams,
+GEN_KEYS = ("tokens", "n_masks", "beam", "tau", "epsilon", "temperature",
+            "levels", "ledger_weight", "keep_learning", "initial_state",
+            "template_associates")
+
+
+class TextEngine:
+    """Trained model + corpus statistics, reusable across many generations."""
+
+    def __init__(
+        self,
+        corpus: Optional[Sequence[str]] = None,
+        *,
+        corpus_text: Optional[str] = None,
+        order: int = 5,
+        alpha: float = 0.25,
+        warm_limit: int = 20000,
+    ) -> None:
+        if corpus_text is not None:
+            self.corpus_text, self.sources = corpus_text, ["<text>"]
+        else:
+            self.corpus_text, self.sources = load_corpus(corpus)
+
+        self.corpus_tokens = tokenize(self.corpus_text)
+        if not self.corpus_tokens:
+            raise ValueError("Corpus contains no recognizable tokens.")
+
+        self.model = NGramModel(order=order, alpha=alpha)
+        self.model.train(self.corpus_text)
+        self.associations = build_associations(self.model)
+        self.warm_tokens = self.corpus_tokens[:max(0, warm_limit)] or None
+
+        self.sentences = [
+            tokenize(s)
+            for s in re.split(r"(?<=[.!?])\s+", self.corpus_text.strip())
+            if s.strip()
+        ]
+        self.corpus_ngrams = build_corpus_ngrams(self.sentences)
+
+    def generate_text(
+        self,
+        prompt: str = "A process",
+        *,
+        tokens: int = 200,
+        seed: int = 7,
+        trace: bool = False,
+        n_masks: int = 512,
+        beam: int = 12,
+        tau: float = 0.95,
+        epsilon: float = 0.6,
+        temperature: float = 0.85,
+        levels: int = 5,
+        ledger_weight: float = 0.9,
+        keep_learning: bool = False,
+        initial_state: str = "OBSERVE",
+        template_associates: int = 4,
+    ) -> Dict[str, Any]:
+        combinator = MechanismCombinator(n_masks, seed=seed)
+        text, segments, ledger = generate(
+            self.model,
+            prompt,
+            token_count=max(1, tokens),
+            beam_size=max(1, beam),
+            tau=float(np.clip(tau, 0.0, 1.0)),
+            temperature=max(0.0, temperature),
+            seed=seed,
+            show_trace=trace,
+            levels=levels,
+            ledger_weight=ledger_weight,
+            warm_tokens=self.warm_tokens,
+            lock_ledger=not keep_learning,
+            initial_state=initial_state,
+            template_associates=max(1, template_associates),
+            epsilon=float(np.clip(epsilon, 0.0, 1.0)),
+            corpus_ngrams=self.corpus_ngrams,
+            combinator=combinator,
+            base_associations=self.associations,
         )
+        agree = [s["mechanism_agreement"] for s in segments
+                 if s["mechanism_agreement"] is not None]
+        return {
+            "prompt": prompt,
+            "seed": seed,
+            "text": text,
+            "segments": segments,
+            "n_tokens": len(tokenize(text)),
+            "n_segments": len(segments),
+            "mean_natural_rate": float(np.mean([s["natural_rate"] for s in segments])),
+            "mean_novelty": float(np.mean([s["novelty"] for s in segments])),
+            "mean_agreement": float(np.mean(agree)) if agree else None,
+            "relaxations": int(sum(s["relaxations"] for s in segments)),
+            "fallbacks": int(sum(s["fallbacks"] for s in segments)),
+            "ledger": ledger.stats(),
+        }
 
-        print("\n--- GENERATED TEXT ---\n")
-        print(text)
+    def auto_prompts(self, n: int, seed: int = 7, max_words: int = 3) -> List[str]:
+        """Prompts taken from the starts of randomly chosen corpus sentences."""
+        rng = random.Random(seed)
+        pool = [s for s in self.sentences if any(content_word(t) for t in s)]
+        rng.shuffle(pool)
+        out: List[str] = []
+        for sentence in pool:
+            words = [t for t in sentence if t not in PUNCT][:rng.randint(1, max_words)]
+            prompt = " ".join(words)
+            if prompt and prompt not in out:
+                out.append(prompt)
+            if len(out) >= n:
+                break
+        return out or ["A process"]
 
-        if args.save:
-            Path(args.save).write_text(text, encoding="utf-8")
-            print(f"\n[Saved output to {args.save}]")
 
-        if args.segments_json:
-            Path(args.segments_json).write_text(
-                json.dumps(segments, indent=2, ensure_ascii=False),
-                encoding="utf-8",
-            )
-            print(f"[Saved segments to {args.segments_json}]")
+_ENGINES: Dict[Tuple, TextEngine] = {}
 
-   
+
+def generate_text(
+    prompt: str = "A process",
+    corpus: Optional[Sequence[str]] = None,
+    *,
+    engine: Optional[TextEngine] = None,
+    **options: Any,
+) -> Dict[str, Any]:
+    """One-call API. Engines are cached per corpus."""
+    if engine is None:
+        key = tuple(corpus or ())
+        engine = _ENGINES.get(key)
+        if engine is None:
+            engine = _ENGINES[key] = TextEngine(
+                corpus, order=CONFIG["order"], alpha=CONFIG["alpha"],
+                warm_limit=CONFIG["warm_limit"])
+    return engine.generate_text(prompt, **options)
+
+
+CSV_COLUMNS = (
+    "id", "prompt", "seed", "text", "n_tokens", "n_segments",
+    "mean_natural_rate", "mean_novelty", "mean_agreement",
+    "relaxations", "fallbacks",
+)
+
+
+def build_dataset(
+    engine: TextEngine,
+    prompts: Sequence[str],
+    *,
+    seeds: Sequence[int] = (7,),
+    out_path: Optional[str] = None,
+    include_segments: bool = True,
+    progress: bool = True,
+    **options: Any,
+) -> List[Dict[str, Any]]:
+    """Generate prompts x seeds samples; optionally write JSONL or CSV."""
+    rows: List[Dict[str, Any]] = []
+    total = len(prompts) * len(seeds)
+
+    for prompt in prompts:
+        for seed in seeds:
+            result = engine.generate_text(prompt, seed=seed, **options)
+            row = {"id": len(rows), **result}
+            row.pop("ledger", None)
+            if not include_segments:
+                row.pop("segments", None)
+            rows.append(row)
+            if progress:
+                print(f"[dataset] {len(rows)}/{total} prompt={prompt!r} seed={seed}")
+
+    if out_path:
+        path = Path(out_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.suffix.lower() == ".csv":
+            with path.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=CSV_COLUMNS,
+                                        extrasaction="ignore")
+                writer.writeheader()
+                writer.writerows(rows)
+        else:
+            with path.open("w", encoding="utf-8") as handle:
+                for row in rows:
+                    handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+        if progress:
+            print(f"[dataset] wrote {len(rows)} rows to {path}")
+
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# Interactive main (no arguments)
+# ---------------------------------------------------------------------------
+
+HELP = (
+    "Type a prompt to generate.  Commands:  :dataset  build a dataset with "
+    "CONFIG settings,  :matrix  save the function Gram matrix,  :trace  toggle "
+    "per-token trace,  :quit"
+)
+
+
+def main() -> None:
+    answer = input("Corpus file or folder (blank = built-in corpus): ").strip()
+    sources = [answer] if answer else None
+    try:
+        engine = TextEngine(sources, order=CONFIG["order"], alpha=CONFIG["alpha"],
+                            warm_limit=CONFIG["warm_limit"])
+    except (OSError, ValueError) as exc:
+        raise SystemExit(f"Could not load corpus: {exc}")
+
+    print(f"[corpus] {len(engine.corpus_tokens)} tokens from "
+          f"{len(engine.sources)} source(s)")
+    print(HELP)
+
+    options = {k: CONFIG[k] for k in GEN_KEYS}
+
     while True:
-        run(args.prompt)
+        try:
+            prompt = input("Prompt> ").strip()
+        except EOFError:
+            break
+        if prompt in {":quit", ":q"}:
+            break
+        if prompt == ":trace":
+            CONFIG["trace"] = not CONFIG["trace"]
+            print(f"[trace] {'on' if CONFIG['trace'] else 'off'}")
+            continue
+        if prompt == ":matrix":
+            names, gram = function_inner_product_matrix(Path(__file__))
+            save_function_inner_product_matrix(
+                Path("function_inner_product.csv"), names, gram)
+            print(f"[function-matrix] saved {len(names)} x {len(names)} matrix "
+                  f"to function_inner_product.csv")
+            continue
+        if prompt == ":dataset":
+            prompts = engine.auto_prompts(CONFIG["dataset_prompts"], CONFIG["seed"])
+            build_dataset(
+                engine, prompts,
+                seeds=[CONFIG["seed"] + i for i in range(CONFIG["dataset_seeds"])],
+                out_path=CONFIG["dataset_out"], **options)
+            continue
+
+        prompt = prompt or CONFIG["default_prompt"]
+        result = engine.generate_text(
+            prompt, seed=CONFIG["seed"], trace=CONFIG["trace"], **options)
+        print("\n--- GENERATED TEXT ---\n")
+        print(result["text"])
+        if result["mean_agreement"] is not None:
+            print(f"\n[mechanism agreement {result['mean_agreement']:.2f} over "
+                  f"{CONFIG['n_masks']} mechanisms/step]\n")
 
 
 if __name__ == "__main__":
