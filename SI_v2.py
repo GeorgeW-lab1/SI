@@ -108,9 +108,9 @@ class PhotonicBridgedDecoder:
                 }
             for N, control_scope in scopes.items():
                 
-                import random; chunk = lambda path, n=100: (lambda w: " ".join(w[(i := random.randrange(max(1, len(w) - n + 1))):i+n]))(open(path).read().split()); print(chunk("xaa"))
+                import random; chunk = lambda path, n=100: (lambda w: " ".join(w[(i := random.randrange(max(1, len(w) - n + 1))):i+n]))(open(path).read().split());
                 messages = [
-                    {"role": "system", "content": f"Explain your strategy clearly as {control_scope}"}, #{N}+{Control Scope} stepped lingual environment container/paradigm
+                    {"role": "system", "content": f"Explain your strategy clearly as a {control_scope} scope"}, #{N}+{Control Scope} stepped lingual environment container/paradigm
                     {"role": "user", "content": chunk} #raw environment in
                 ]
                
