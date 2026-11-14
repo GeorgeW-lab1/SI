@@ -99,27 +99,38 @@ class PhotonicBridgedDecoder:
         print("[+] Model loaded successfully.")
 
     def reason(self, prompt):
-        messages = [
-            {"role": "system", "content": "Explain your strategy clearly in natural sentences."}, #{N}+{Control Scope} stepped lingual environment container/paradigm
-            {"role": "user", "content": prompt} #raw environment in
-        ]
-        formatted = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        inputs = self.tokenizer(formatted, return_tensors="pt", truncation=True, max_length=512).to(self.model.device)
-        
-        with torch.no_grad():
-            outputs = self.model.generate(
-                **inputs,
-                max_new_tokens=6400,
-                temperature=0.7,
-                do_sample=True,
-                top_p=0.9,
-                repetition_penalty=1.12,
-                use_cache=True,
-                pad_token_id=self.tokenizer.pad_token_id
-            )
-        return self.tokenizer.decode(outputs[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True).strip()
+        while True:
+            scopes = {
+                    1: "Imperative",
+                    2: "Declarative",
+                    3: "Functional",
+                    4: "Natural-Language",
+                }
+            for N, control_scope in scopes.items():
+                
+                import random; chunk = (lambda L, n=5: "".join(L[(i := random.randrange(max(1, 100 - n + 1))):i+n]))(open("xaa").readlines())
+                messages = [
+                    {"role": "system", "content": f"Explain your strategy clearly as {control_scope}"}, #{N}+{Control Scope} stepped lingual environment container/paradigm
+                    {"role": "user", "content": chunk} #raw environment in
+                ]
+               
+                    
+                formatted = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+                inputs = self.tokenizer(formatted, return_tensors="pt", truncation=True, max_length=512).to(self.model.device)
+                
+                with torch.no_grad():
+                    outputs = self.model.generate(
+                        **inputs,
+                        max_new_tokens=6400,
+                        temperature=0.7,
+                        do_sample=True,
+                        top_p=0.9,
+                        repetition_penalty=1.12,
+                        use_cache=True,
+                        pad_token_id=self.tokenizer.pad_token_id
+                    )
+                    print(f"\n[Model Reasoning Output]:\n{self.tokenizer.decode(outputs[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True).strip()}\n")
 
-   
 # ------------------------------------------------------------------
 # Dataset Ingestion & Photonic Channel Simulation
 # ------------------------------------------------------------------
@@ -195,7 +206,7 @@ def photonic_bridged_decode(weights, target_sum, est_b, margins, salt, commit, l
             break
         reasoning_prompt = user_input
         reasoning_output = llm.reason(reasoning_prompt)
-        print(f"\n[Model Reasoning Output]:\n{reasoning_output}\n")
+        
 
 
 
