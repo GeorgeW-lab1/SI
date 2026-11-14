@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-Photonic Lite LLM Instruct Subset-Sum Decoder (Hugging Face Datasets & Local Transformers)
+Photonic Extremely Lite Qwen Subset-Sum Decoder (Hugging Face Datasets & Local Transformers)
 
 Pipeline:
 1. Load a native Parquet dataset from Hugging Face (`datasets`).
 2. Map features into a subset-sum instance with cryptographic commitment.
 3. Send secret bits through a simulated photonic channel (optical pooling, confidence gating).
-4. Prompt a local lightweight instruct model via Hugging Face transformers to propose targeted bit repairs.
+4. Prompt an ultra-lightweight model (0.5B/1.5B) via Hugging Face transformers to propose targeted bit repairs.
 5. Verify candidates with exact NumPy matrix dot products and SHA-256 checks.
 
 Requires: pip install transformers datasets torch accelerate numpy pandas huggingface-hub
@@ -50,20 +50,20 @@ LEVEL_WHITE = 255
 
 
 # ------------------------------------------------------------------
-# Local Non-Gated Lightweight Instruct Model Wrapper (Qwen 2.5 Lite)
+# Local Extremely Lite Instruct Model Wrapper (Qwen 2.5 0.5B)
 # ------------------------------------------------------------------
 
 class LocalInstructDecoder:
     """
-    Local instruction-tuned model wrapper using a lightweight open repository.
-    Runs efficiently on local hardware via Hugging Face transformers.
+    Local instruction-tuned model wrapper using an ultra-lightweight open repository.
+    Runs with minimal VRAM/RAM overhead via Hugging Face transformers.
     """
 
     def __init__(
         self,
-        model_name="Qwen/Qwen2.5-1.5B-Instruct",
-        temperature=0.2,
-        max_tokens=150,
+        model_name="Qwen/Qwen2.5-0.5B-Instruct",
+        temperature=0.1,
+        max_tokens=100,
         seed=1337
     ):
         self.model_name = model_name
@@ -75,7 +75,7 @@ class LocalInstructDecoder:
         self.completion_chars = 0
 
         torch.manual_seed(seed)
-        print(f"[+] Loading local lightweight model: '{self.model_name}' (this may take a moment)...")
+        print(f"[+] Loading extremely lite model: '{self.model_name}'...")
 
         self.tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=False)
         if self.tokenizer.pad_token is None:
@@ -88,15 +88,15 @@ class LocalInstructDecoder:
             device_map="auto"
         )
         self.model.eval()
-        print("[+] Model loaded successfully.")
+        print("[+] Lite model loaded successfully.")
 
     def complete(self, prompt):
         self.calls += 1
         self.prompt_chars += len(prompt)
 
-        # Structure prompt using Qwen's native chat template format
+        # Structure prompt using concise messaging tailored for small-parameter models
         messages = [
-            {"role": "system", "content": "You are a precise cryptographic optimization assistant. Return JSON only."},
+            {"role": "system", "content": "Output only valid JSON with format: {\"flips\": [[idx1, idx2]]}"},
             {"role": "user", "content": prompt}
         ]
         formatted_prompt = self.tokenizer.apply_chat_template(
@@ -109,7 +109,7 @@ class LocalInstructDecoder:
             formatted_prompt,
             return_tensors="pt",
             truncation=True,
-            max_length=2048,
+            max_length=1536,
             padding=True
         ).to(self.model.device)
 
@@ -123,7 +123,7 @@ class LocalInstructDecoder:
                 max_new_tokens=self.max_tokens,
                 temperature=self.temperature,
                 do_sample=True,
-                top_p=0.90,
+                top_p=0.85,
                 pad_token_id=self.tokenizer.pad_token_id
             )
 
@@ -297,30 +297,16 @@ def verify_candidate(weights, target_sum, candidate, salt, commit):
 
 
 # ------------------------------------------------------------------
-# LLM Prompt Construction & Parsing
+# LLM Prompt Construction & Parsing (Optimized for Lite Models)
 # ------------------------------------------------------------------
 
 def build_llm_prompt(
     m, target_sum, current_sum, residual, candidate, margins, weights, uncertain, round_no, max_proposals, max_flips
 ):
-    direction = "Current sum is TOO HIGH. Propose 1 -> 0 flips." if residual < 0 else "Current sum is TOO LOW. Propose 0 -> 1 flips."
+    # Keep prompt brief and structured for lower parameter footprint
+    top_indices = [str(int(i)) for i in uncertain[:10]]
     
-    uncertain_rows = "\n".join([
-        f"  - index: {i}, weight: {int(weights[i])}, current_bit: {int(candidate[i])}, margin: {int(margins[i])}"
-        for i in uncertain[:16]
-    ])
-
-    prompt = f"""Target Sum: {target_sum}
-Current Sum: {current_sum}
-Residual (Target - Current): {residual}
-Strategy: {direction}
-
-Uncertain Bit Candidates:
-{uncertain_rows}
-
-Provide a JSON object with a key 'flips' containing up to {max_proposals} arrays of bit indices to flip to reduce the residual towards zero. Example format:
-{{"flips": [[index1, index2], [index3]]}}
-"""
+    prompt = input("Prompt: ")
     return prompt
 
 
@@ -475,7 +461,7 @@ def local_residual_repair(weights, target_sum, start, margins, salt, commit, max
 
 def interactive_loop(weights, secret_b, target_sum, salt, commit, margins, est_b, llm):
     print("\n" + "="*60)
-    print(" INTERACTIVE PHOTONIC LITE LLM DECODER PROMPT MODE ")
+    print(" INTERACTIVE PHOTONIC LITE DECODER PROMPT MODE ")
     print("="*60)
     print("Type 'run' to execute decoding with current parameters.")
     print("Type 'target <number>' to change the target sum.")
@@ -564,14 +550,14 @@ def interactive_loop(weights, secret_b, target_sum, salt, commit, margins, est_b
 # ------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="Photonic Lite LLM Subset-Sum Decoder")
+    parser = argparse.ArgumentParser(description="Photonic Extremely Lite Subset-Sum Decoder")
     parser.add_argument("--hf-dataset", default="zeroshot/twitter-financial-news-sentiment", help="Hugging Face dataset name")
     parser.add_argument("--hf-subset", default=None, help="Dataset subset config")
     parser.add_argument("--rows", type=int, default=ROWS)
     parser.add_argument("--cols", type=int, default=COLS)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--cycles", type=int, default=49)
-    parser.add_argument("--model-name", default="Qwen/Qwen2.5-1.5B-Instruct", help="Hugging Face model name (Lite)")
+    parser.add_argument("--model-name", default="Qwen/Qwen2.5-0.5B-Instruct", help="Hugging Face model name (Extremely Lite)")
     parser.add_argument("--interactive", action="store_true", help="Launch interactive prompt loop")
     args = parser.parse_args()
 
