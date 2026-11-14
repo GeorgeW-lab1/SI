@@ -100,8 +100,8 @@ class PhotonicBridgedDecoder:
 
     def reason(self, prompt):
         messages = [
-            {"role": "system", "content": "Explain your strategy clearly in natural sentences."},
-            {"role": "user", "content": prompt}
+            {"role": "system", "content": "Explain your strategy clearly in natural sentences."}, #{N}+{Control Scope} stepped lingual environment container/paradigm
+            {"role": "user", "content": prompt} #raw environment in
         ]
         formatted = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         inputs = self.tokenizer(formatted, return_tensors="pt", truncation=True, max_length=512).to(self.model.device)
