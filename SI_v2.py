@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-Photonic Qwen 7B Instruct Subset-Sum Decoder (Hugging Face Datasets & Local Transformers)
+Photonic Lite LLM Instruct Subset-Sum Decoder (Hugging Face Datasets & Local Transformers)
 
 Pipeline:
 1. Load a native Parquet dataset from Hugging Face (`datasets`).
 2. Map features into a subset-sum instance with cryptographic commitment.
 3. Send secret bits through a simulated photonic channel (optical pooling, confidence gating).
-4. Prompt a local non-gated 7B instruct model via Hugging Face transformers to propose targeted bit repairs.
+4. Prompt a local lightweight instruct model via Hugging Face transformers to propose targeted bit repairs.
 5. Verify candidates with exact NumPy matrix dot products and SHA-256 checks.
 
 Requires: pip install transformers datasets torch accelerate numpy pandas huggingface-hub
@@ -21,7 +21,6 @@ import re
 import sys
 import time
 from pathlib import Path
-
 import numpy as np
 import pandas as pd
 
@@ -51,18 +50,18 @@ LEVEL_WHITE = 255
 
 
 # ------------------------------------------------------------------
-# Local Non-Gated 7B Instruct Model Wrapper (Qwen 2.5)
+# Local Non-Gated Lightweight Instruct Model Wrapper (Qwen 2.5 Lite)
 # ------------------------------------------------------------------
 
 class LocalInstructDecoder:
     """
-    Local instruction-tuned model wrapper using a non-gated open repository.
-    Runs entirely on local hardware via Hugging Face transformers.
+    Local instruction-tuned model wrapper using a lightweight open repository.
+    Runs efficiently on local hardware via Hugging Face transformers.
     """
 
     def __init__(
         self,
-        model_name="Qwen/Qwen2.5-7B-Instruct",
+        model_name="Qwen/Qwen2.5-1.5B-Instruct",
         temperature=0.2,
         max_tokens=150,
         seed=1337
@@ -76,9 +75,9 @@ class LocalInstructDecoder:
         self.completion_chars = 0
 
         torch.manual_seed(seed)
-        print(f"[+] Loading local non-gated model: '{self.model_name}' (this may take a moment)...")
+        print(f"[+] Loading local lightweight model: '{self.model_name}' (this may take a moment)...")
 
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=False)
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
@@ -306,12 +305,23 @@ def build_llm_prompt(
 ):
     direction = "Current sum is TOO HIGH. Propose 1 -> 0 flips." if residual < 0 else "Current sum is TOO LOW. Propose 0 -> 1 flips."
     
-    rows = [
-        f"index={i}, weight={int(weights[i])}, current_bit={int(candidate[i])}, margin={int(margins[i])}"
-        for i in uncertain
-    ]
+    uncertain_rows = "\n".join([
+        f"  - index: {i}, weight: {int(weights[i])}, current_bit: {int(candidate[i])}, margin: {int(margins[i])}"
+        for i in uncertain[:16]
+    ])
 
-    return input("Prompt: ")
+    prompt = f"""Target Sum: {target_sum}
+Current Sum: {current_sum}
+Residual (Target - Current): {residual}
+Strategy: {direction}
+
+Uncertain Bit Candidates:
+{uncertain_rows}
+
+Provide a JSON object with a key 'flips' containing up to {max_proposals} arrays of bit indices to flip to reduce the residual towards zero. Example format:
+{{"flips": [[index1, index2], [index3]]}}
+"""
+    return prompt
 
 
 def parse_llm_proposals(text, m, max_proposals=8, max_flips=6):
@@ -465,7 +475,7 @@ def local_residual_repair(weights, target_sum, start, margins, salt, commit, max
 
 def interactive_loop(weights, secret_b, target_sum, salt, commit, margins, est_b, llm):
     print("\n" + "="*60)
-    print(" INTERACTIVE PHOTONIC QWEN DECODER PROMPT MODE ")
+    print(" INTERACTIVE PHOTONIC LITE LLM DECODER PROMPT MODE ")
     print("="*60)
     print("Type 'run' to execute decoding with current parameters.")
     print("Type 'target <number>' to change the target sum.")
@@ -554,14 +564,14 @@ def interactive_loop(weights, secret_b, target_sum, salt, commit, margins, est_b
 # ------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="Photonic Qwen Subset-Sum Decoder")
+    parser = argparse.ArgumentParser(description="Photonic Lite LLM Subset-Sum Decoder")
     parser.add_argument("--hf-dataset", default="zeroshot/twitter-financial-news-sentiment", help="Hugging Face dataset name")
     parser.add_argument("--hf-subset", default=None, help="Dataset subset config")
     parser.add_argument("--rows", type=int, default=ROWS)
     parser.add_argument("--cols", type=int, default=COLS)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--cycles", type=int, default=49)
-    parser.add_argument("--model-name", default="Qwen/Qwen2.5-7B-Instruct", help="Hugging Face model name")
+    parser.add_argument("--model-name", default="Qwen/Qwen2.5-1.5B-Instruct", help="Hugging Face model name (Lite)")
     parser.add_argument("--interactive", action="store_true", help="Launch interactive prompt loop")
     args = parser.parse_args()
 
