@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
-Photonic GPT-2 Subset-Sum Decoder (Hugging Face Datasets & Local Transformers)
+Photonic Qwen 7B Instruct Subset-Sum Decoder (Hugging Face Datasets & Local Transformers)
 
 Pipeline:
 1. Load a native Parquet dataset from Hugging Face (`datasets`).
 2. Map features into a subset-sum instance with cryptographic commitment.
 3. Send secret bits through a simulated photonic channel (optical pooling, confidence gating).
-4. Prompt a local GPT-2 model via Hugging Face transformers to propose targeted bit repairs.
+4. Prompt a local non-gated 7B instruct model via Hugging Face transformers to propose targeted bit repairs.
 5. Verify candidates with exact NumPy matrix dot products and SHA-256 checks.
 
-Requires: pip install transformers datasets torch numpy pandas huggingface-hub
+Requires: pip install transformers datasets torch accelerate numpy pandas huggingface-hub
 """
 
 import argparse
@@ -51,24 +51,24 @@ LEVEL_WHITE = 255
 
 
 # ------------------------------------------------------------------
-# Local GPT-2 Wrapper
+# Local Non-Gated 7B Instruct Model Wrapper (Qwen 2.5)
 # ------------------------------------------------------------------
 
-class LocalGPT2Decoder:
+class LocalInstructDecoder:
     """
-    Local GPT-2 model wrapper for subset-sum repair proposals.
-    Runs entirely on CPU or GPU without external API dependencies.
+    Local instruction-tuned model wrapper using a non-gated open repository.
+    Runs entirely on local hardware via Hugging Face transformers.
     """
 
     def __init__(
         self,
-        model_name="gpt2",
+        model_name="Qwen/Qwen2.5-7B-Instruct",
         temperature=0.2,
-        max_tokens=220,
+        max_tokens=150,
         seed=1337
     ):
         self.model_name = model_name
-        self.temperature = max(temperature, 1e-5) # Prevent zero division
+        self.temperature = max(temperature, 1e-5)
         self.max_tokens = max_tokens
         self.seed = seed
         self.calls = 0
@@ -76,21 +76,44 @@ class LocalGPT2Decoder:
         self.completion_chars = 0
 
         torch.manual_seed(seed)
-        print(f"[+] Loading local GPT-2 model: '{self.model_name}'...")
+        print(f"[+] Loading local non-gated model: '{self.model_name}' (this may take a moment)...")
 
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
-        self.model = AutoModelForCausalLM.from_pretrained(model_name)
+        # Load with automatic device mapping and half-precision for efficiency
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            torch_dtype=torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16,
+            device_map="auto"
+        )
         self.model.eval()
-        print("[+] GPT-2 model loaded successfully.")
+        print("[+] Model loaded successfully.")
 
     def complete(self, prompt):
         self.calls += 1
         self.prompt_chars += len(prompt)
 
-        inputs = self.tokenizer(prompt, return_tensors="pt", padding=True)
+        # Structure prompt using Qwen's native chat template format
+        messages = [
+            {"role": "system", "content": "You are a precise cryptographic optimization assistant. Return JSON only."},
+            {"role": "user", "content": prompt}
+        ]
+        formatted_prompt = self.tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True
+        )
+
+        inputs = self.tokenizer(
+            formatted_prompt,
+            return_tensors="pt",
+            truncation=True,
+            max_length=2048,
+            padding=True
+        ).to(self.model.device)
+
         input_ids = inputs["input_ids"]
         attention_mask = inputs["attention_mask"]
 
@@ -105,7 +128,6 @@ class LocalGPT2Decoder:
                 pad_token_id=self.tokenizer.pad_token_id
             )
 
-        # Decode only the generated tail
         prompt_len = input_ids.shape[1]
         generated_tokens = outputs[0][prompt_len:]
         text = self.tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
@@ -126,9 +148,6 @@ def load_or_fetch_dataset(
     seed=42,
     **kwargs
 ):
-    """
-    Fetches a native dataset from Hugging Face, avoiding legacy dataset scripts.
-    """
     print(f"[+] Loading Hugging Face dataset: '{dataset_name}'")
     
     try:
@@ -305,14 +324,12 @@ Least reliable optical bits:
 
 Propose up to {max_proposals} repair moves. Each move flips at most {max_flips} indices.
 Return JSON strictly in this form:
-{{"flips": [[index1, index2], [index3]]}}
-JSON:"""
+{{"flips": [[index1, index2], [index3]]}}"""
 
 
 def parse_llm_proposals(text, m, max_proposals=8, max_flips=6):
     proposals = []
     try:
-        # Try to find JSON block in output text
         match = re.search(r"\{.*?\}", text, re.DOTALL)
         json_str = match.group(0) if match else text
         parsed = json.loads(json_str)
@@ -368,9 +385,12 @@ def photonic_llm_decode(
         )
 
         response = llm.complete(prompt)
+        print(f"\n[Model Raw Output (Round {round_no})]:\n{response}\n")
+
         proposals = parse_llm_proposals(response, m, max_proposals=proposals_per_round, max_flips=max_flips)
 
         if not proposals:
+            print("[+] No valid JSON proposals parsed this round.")
             continue
 
         round_best, round_best_sum, round_best_residual, round_best_abs_residual = None, best_sum, best_residual, best_abs_residual
@@ -383,7 +403,7 @@ def photonic_llm_decode(
             candidate_tests += 1
 
             if verified:
-                return candidate, {"verified": True, "source": f"gpt2_round_{round_no}", "llm_calls": llm.calls, "candidate_tests": candidate_tests, "rounds": round_no, "residual": 0}
+                return candidate, {"verified": True, "source": f"qwen_round_{round_no}", "llm_calls": llm.calls, "candidate_tests": candidate_tests, "rounds": round_no, "residual": 0}
 
             if abs(residual) < round_best_abs_residual:
                 round_best = candidate
@@ -393,7 +413,7 @@ def photonic_llm_decode(
 
         if round_best is not None:
             best, best_sum, best_residual, best_abs_residual = round_best, round_best_sum, round_best_residual, round_best_abs_residual
-            print(f"[GPT-2] Round {round_no}: Residual improved to {best_residual}")
+            print(f"[Model] Round {round_no}: Residual improved to {best_residual}")
 
     if use_local_fallback:
         print("[+] Running deterministic residual fallback solver...")
@@ -453,23 +473,113 @@ def local_residual_repair(weights, target_sum, start, margins, salt, commit, max
 
 
 # ------------------------------------------------------------------
+# Interactive CLI Loop
+# ------------------------------------------------------------------
+
+def interactive_loop(weights, secret_b, target_sum, salt, commit, margins, est_b, llm):
+    print("\n" + "="*60)
+    print(" INTERACTIVE PHOTONIC QWEN DECODER PROMPT MODE ")
+    print("="*60)
+    print("Type 'run' to execute decoding with current parameters.")
+    print("Type 'target <number>' to change the target sum.")
+    print("Type 'status' to view current setup.")
+    print("Type 'exit' or 'quit' to close.")
+    print("="*60 + "\n")
+
+    current_target = target_sum
+    current_est = est_b
+
+    while True:
+        try:
+            user_input = input("photonic-decoder> ").strip()
+        except (KeyboardInterrupt, EOFError):
+            print("\nExiting.")
+            break
+
+        if not user_input:
+            continue
+
+        parts = user_input.split(maxsplit=1)
+        cmd = parts[0].lower()
+
+        if cmd in ["exit", "quit"]:
+            print("Goodbye!")
+            break
+
+        elif cmd == "status":
+            print(f"  [Status]")
+            print(f"  Variables (m): {len(weights)}")
+            print(f"  Target Sum:    {current_target}")
+            print(f"  Bit Errors:    {int(np.sum(secret_b != current_est))}")
+            continue
+
+        elif cmd == "target":
+            if len(parts) < 2:
+                print("[-] Error: Provide a target value.")
+                continue
+            try:
+                current_target = int(parts[1])
+                print(f"[+] Target sum updated to: {current_target}")
+            except ValueError:
+                print("[-] Error: Target must be an integer.")
+            continue
+
+        elif cmd == "run":
+            print("[+] Starting decoding pipeline with current target...")
+            start_time = time.time()
+            recovered, stats = photonic_llm_decode(
+                weights=weights,
+                target_sum=current_target,
+                est_b=current_est,
+                margins=margins,
+                salt=salt,
+                commit=commit,
+                llm=llm
+            )
+            elapsed = time.time() - start_time
+
+            final_verified, final_sum, final_residual, digest_match = verify_candidate(
+                weights, current_target, recovered, salt, commit
+            )
+
+            print("\n---------------- DECODER OUTPUT SUMMARY ----------------")
+            print(f"Verified exact recovery: {final_verified}")
+            print(f"Final subset sum:        {final_sum}")
+            print(f"Target subset sum:       {current_target}")
+            print(f"Final residual:          {final_residual}")
+            print(f"SHA-256 digest match:    {digest_match}")
+            print(f"Bit errors vs secret:    {int(np.sum(secret_b != recovered))}")
+            print(f"Model generation calls:  {stats['llm_calls']}")
+            print(f"Candidate tests:         {stats['candidate_tests']}")
+            print(f"Recovery source:         {stats['source']}")
+            print(f"Elapsed time:            {elapsed:.3f} seconds")
+            print("--------------------------------------------------------\n")
+            current_est = recovered
+
+        else:
+            print(f"[Model Direct Prompt Query]: {user_input}")
+            response = llm.complete(user_input)
+            print(f"\n[Model Output]:\n{response}\n")
+
+
+# ------------------------------------------------------------------
 # Main Execution Entry Point
 # ------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="Photonic GPT-2 Subset-Sum Decoder using Hugging Face datasets & transformers")
+    parser = argparse.ArgumentParser(description="Photonic Qwen Subset-Sum Decoder")
     parser.add_argument("--hf-dataset", default="zeroshot/twitter-financial-news-sentiment", help="Hugging Face dataset name")
     parser.add_argument("--hf-subset", default=None, help="Dataset subset config")
     parser.add_argument("--rows", type=int, default=ROWS)
     parser.add_argument("--cols", type=int, default=COLS)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--cycles", type=int, default=49)
-    parser.add_argument("--model-name", default="gpt2", help="Hugging Face model name (e.g. gpt2)")
+    parser.add_argument("--model-name", default="Qwen/Qwen2.5-7B-Instruct", help="Hugging Face model name")
+    parser.add_argument("--interactive", action="store_true", help="Launch interactive prompt loop")
     args = parser.parse_args()
 
     m = args.rows * args.cols
 
-    # 1. Load real data from Hugging Face Datasets
     weights, secret_b, target_sum = load_or_fetch_dataset(
         dataset_name=args.hf_dataset,
         subset_name=args.hf_subset,
@@ -481,7 +591,6 @@ def main():
     packed_secret = np.packbits(secret_b).tobytes()
     commit = hashlib.sha256(salt + packed_secret).digest()
 
-    # 2. Simulate Photonic Channel
     channel = PhotonicChannel(m=m, seed=args.seed + 1)
     lo, span, gray_z = calibrate_photonic_channel(channel)
 
@@ -498,37 +607,36 @@ def main():
     margins = ones_counts - zeros_counts
     est_b = (margins > 0).astype(np.uint8)
 
-    # 3. Initialize Local GPT-2 Decoder
-    llm = LocalGPT2Decoder(model_name=args.model_name, seed=args.seed)
+    llm = LocalInstructDecoder(model_name=args.model_name, seed=args.seed)
 
-    # 4. Run Iterative GPT-2 Repair Pipeline
-    start_time = time.time()
-    recovered, stats = photonic_llm_decode(
-        weights=weights,
-        target_sum=target_sum,
-        est_b=est_b,
-        margins=margins,
-        salt=salt,
-        commit=commit,
-        llm=llm
-    )
-    elapsed = time.time() - start_time
+    if args.interactive:
+        interactive_loop(weights, secret_b, target_sum, salt, commit, margins, est_b, llm)
+    else:
+        print("[+] Running automatic decoding pass...")
+        recovered, stats = photonic_llm_decode(
+            weights=weights,
+            target_sum=target_sum,
+            est_b=est_b,
+            margins=margins,
+            salt=salt,
+            commit=commit,
+            llm=llm
+        )
 
-    final_verified, final_sum, final_residual, digest_match = verify_candidate(
-        weights, target_sum, recovered, salt, commit
-    )
+        final_verified, final_sum, final_residual, digest_match = verify_candidate(
+            weights, target_sum, recovered, salt, commit
+        )
 
-    print("\n================ PHOTONIC GPT-2 DECODER RESULTS ================")
-    print(f"Verified exact recovery: {final_verified}")
-    print(f"Final subset sum:        {final_sum}")
-    print(f"Target subset sum:       {target_sum}")
-    print(f"SHA-256 digest match:    {digest_match}")
-    print(f"Bit errors vs secret:    {int(np.sum(secret_b != recovered))}")
-    print(f"Model generation calls:  {stats['llm_calls']}")
-    print(f"Candidate tests:         {stats['candidate_tests']}")
-    print(f"Recovery source:         {stats['source']}")
-    print(f"Elapsed time:            {elapsed:.3f} seconds")
-    print("================================================================\n")
+        print("\n================ PHOTONIC DECODER RESULTS ================")
+        print(f"Verified exact recovery: {final_verified}")
+        print(f"Final subset sum:        {final_sum}")
+        print(f"Target subset sum:       {target_sum}")
+        print(f"SHA-256 digest match:    {digest_match}")
+        print(f"Bit errors vs secret:    {int(np.sum(secret_b != recovered))}")
+        print(f"Model generation calls:  {stats['llm_calls']}")
+        print(f"Candidate tests:         {stats['candidate_tests']}")
+        print(f"Recovery source:         {stats['source']}")
+        print("===========================================================\n")
 
 
 if __name__ == "__main__":
