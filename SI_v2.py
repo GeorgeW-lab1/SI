@@ -108,7 +108,7 @@ class PhotonicBridgedDecoder:
                 }
             for N, control_scope in scopes.items():
                 
-                import random; chunk = lambda L, n=5: "".join(L[i:i+170])(open("xaa").readlines())
+                import random; chunk = lambda L, n=5: "".join(L[i:i+170])(open("xaa").read())
                 messages = [
                     {"role": "system", "content": f"Explain your strategy clearly as {control_scope}"}, #{N}+{Control Scope} stepped lingual environment container/paradigm
                     {"role": "user", "content": chunk} #raw environment in
