@@ -71,7 +71,7 @@ class LocalInstructDecoder:
         self,
         model_name="Qwen/Qwen2.5-0.5B-Instruct",
         temperature=0.1,
-        max_tokens=100,
+        max_tokens=10000,
         seed=1337
     ):
         self.model_name = model_name
