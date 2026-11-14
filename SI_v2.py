@@ -119,40 +119,7 @@ class PhotonicBridgedDecoder:
             )
         return self.tokenizer.decode(outputs[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True).strip()
 
-    def complete_steered(self, prompt, optical_bridge_context):
-        """Pass 2: Fast, probability-steered index generation."""
-        self.calls += 1
-        messages = [
-            {"role": "system", "content": "Output ONLY to me"},
-            {"role": "user", "content": prompt}
-        ]
-        formatted = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        inputs = self.tokenizer(formatted, return_tensors="pt", truncation=True, max_length=512).to(self.model.device)
-
-        processors = LogitsProcessorList()
-        if optical_bridge_context is not None:
-            processors.append(
-                PhotonicProbabilityBridgeProcessor(
-                    tokenizer=self.tokenizer,
-                    all_indices=optical_bridge_context["indices"],
-                    optical_probabilities=optical_bridge_context["optical_probabilities"],
-                    boost_strength=4.5
-                )
-            )
-
-        with torch.no_grad():
-            outputs = self.model.generate(
-                **inputs,
-                max_new_tokens=self.max_tokens,
-                temperature=self.temperature,
-                do_sample=False,
-                logits_processor=processors,
-                use_cache=True,
-                pad_token_id=self.tokenizer.pad_token_id
-            )
-        return self.tokenizer.decode(outputs[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True).strip()
-
-
+   
 # ------------------------------------------------------------------
 # Dataset Ingestion & Photonic Channel Simulation
 # ------------------------------------------------------------------
