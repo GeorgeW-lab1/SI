@@ -96,7 +96,7 @@ class LocalInstructDecoder:
 
         # Structure prompt using concise messaging tailored for small-parameter models
         messages = [
-            {"role": "system", "content": "Output only valid JSON with format: {\"flips\": [[idx1, idx2]]}"},
+            {"role": "system", "content": " You are a wizard at expert things"},
             {"role": "user", "content": prompt}
         ]
         formatted_prompt = self.tokenizer.apply_chat_template(
