@@ -103,9 +103,9 @@ class PhotonicBridgedDecoder:
         while True:
             scopes = {
                     1: f"{test}",
-                    2: "Declarative",
+                    2: "Write story about the future",
                     3: f"{test}",
-                    4: "Natural-Language",
+                    4: "Design code about the following:",
                 }
             for N, control_scope in scopes.items():
                 
