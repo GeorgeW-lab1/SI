@@ -99,18 +99,19 @@ class PhotonicBridgedDecoder:
         print("[+] Model loaded successfully.")
 
     def reason(self, prompt):
+        test = "init"
         while True:
             scopes = {
-                    1: "Imperative",
+                    1: f"{test}",
                     2: "Declarative",
-                    3: "Functional",
+                    3: f"{test}",
                     4: "Natural-Language",
                 }
             for N, control_scope in scopes.items():
                 
                 import random; chunk = lambda path, n=10: (lambda w: " ".join(w[(i := random.randrange(max(1, len(w) - n + 1))):i+n]))(open(path).read().split());
                 messages = [
-                    {"role": "system", "content": f"Explain the following partial sentence clearly as a {control_scope} scope"}, #{N}+{Control Scope} stepped lingual environment container/paradigm
+                    {"role": "system", "content": f"Explain clearly as step {N} of the {control_scope}: "}, #{N}+{Control Scope} stepped lingual environment container/paradigm
                     {"role": "user", "content": chunk} #raw environment in
                 ]
                
@@ -129,7 +130,8 @@ class PhotonicBridgedDecoder:
                         use_cache=True,
                         pad_token_id=self.tokenizer.pad_token_id
                     )
-                    print(f"\n[Model Reasoning Output]:\n{self.tokenizer.decode(outputs[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True).strip()}\n")
+                    test = self.tokenizer.decode(outputs[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True).strip()
+                    print(f"\n[Model Reasoning Output]:\n{test}\n")
 
 # ------------------------------------------------------------------
 # Dataset Ingestion & Photonic Channel Simulation
