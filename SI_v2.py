@@ -311,20 +311,7 @@ def build_llm_prompt(
         for i in uncertain
     ]
 
-    return f"""Photonic subset-sum repair, round {round_no}.
-
-Variables: {m}
-Target sum: {target_sum}
-Current sum: {current_sum}
-Residual: {residual}
-{direction}
-
-Least reliable optical bits:
-{"\n".join(rows)}
-
-Propose up to {max_proposals} repair moves. Each move flips at most {max_flips} indices.
-Return JSON strictly in this form:
-{{"flips": [[index1, index2], [index3]]}}"""
+    return input("Prompt: ")
 
 
 def parse_llm_proposals(text, m, max_proposals=8, max_flips=6):
