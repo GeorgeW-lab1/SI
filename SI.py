@@ -1,7 +1,7 @@
 import numpy as np
 import re
 from collections import deque
-KB_LIMIT = -1
+KB_LIMIT = 99999
 class WordOptoelectronicLLM:
     def __init__(self, corpus, dt=0.001, seed=42):
         """
