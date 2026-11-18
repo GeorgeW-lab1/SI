@@ -1,201 +1,241 @@
-import numpy as np
-import re
-from collections import deque
-KB_LIMIT = 99999
+
+import numpy as np, re
+from collections import Counter, deque
+
+KB_LIMIT, PRIMARY_FRAC = 99999, 0.75
+LL_FLOOR = 1e-6
+
+# ============================================================
+# 1. OPTOELECTRONIC RESERVOIR
+# ============================================================
 class WordOptoelectronicLLM:
-    def __init__(self, corpus, dt=0.001, seed=42):
-        """
-        Word-level Optoelectronic Reservoir & Stochastic Probe LLM.
-        dt: Simulation timestep in seconds (1ms default)
-        """
-        self.rng = np.random.default_rng(seed)
-        self.dt = dt
-        
-        # Tokenize corpus into words and punctuation tokens
-        self.tokens = self.tokenize(corpus)
-        self.vocab = list(set(self.tokens))
+    def __init__(self, corpus, extra_corpora=None, dt=.001, seed=42):
+        self.rng, self.dt = np.random.default_rng(seed), dt
+        self.raw = [corpus[:KB_LIMIT]] + [(x[:KB_LIMIT]) for x in (extra_corpora or [])]
+        self.primary = self.tokenize(self.raw[0])
+        self.extras = [self.tokenize(x) for x in self.raw[1:]]
+        self.extras = [x for x in self.extras if x]
+        self.vocab = sorted(set(t for ds in [self.primary]+self.extras for t in ds))
         self.vocab_size = len(self.vocab)
-        self.tok_to_id = {w: i for i, w in enumerate(self.vocab)}
-        self.id_to_tok = {i: w for i, w in enumerate(self.vocab)}
-        
-        # Map each unique word to a distinct dual-ROI optical intensity pair (0V to 5V)
-        self.roi_embeddings = self.rng.uniform(0.2, 4.8, size=(self.vocab_size, 2))
-        
-        # --- CIRCUIT PARAMETERS FROM SCHEMATIC ---
-        self.vcc = 5.0
-        
-        # Driver B: Schmitt Trigger Hysteresis Thresholds
-        self.schmitt_high = 3.0
-        self.schmitt_low = 1.5
-        self.driver_b_state = 0.0
-        
-        # RC Integrator Node (R = 1k Ohm, C = 4.7 uF -> tau = 4.7 ms)
-        self.R = 1000.0
-        self.C = 4.7e-6
-        self.tau_rc = self.R * self.C  # 0.0047 s
-        self.v_rc = 0.0
-        
-        # NPN Transistor Clamping Threshold
-        self.v_th_npn = 0.7
-        
-        # Driver A: EMA Filter & 0.5V Comparators
-        self.ema_alpha = 0.25
-        self.ema_top = 0.0
-        self.ema_bot = 0.0
-        self.v_ref_comp = 0.5
-        
-        # Post-AND Delay Line (T_dly = 10 ms)
-        self.t_dly_steps = max(1, int(0.010 / self.dt))
-        self.delay_line = deque([0] * self.t_dly_steps, maxlen=self.t_dly_steps)
-        
-        # D Flip-Flop (DFF) & Clock State
-        self.dff_q = 0
-        self.prev_clk = 0
-        
-        # Secondary Probe Branch (T_probe = 2 * T_main)
-        self.step_count = 0
-        self.probe_accumulator = 0.0
-        
-        # Trainable Readout Matrix (maps multi-tap circuit state -> vocab logits)
-        self.state_dim = 8
-        self.W_out = np.zeros((self.state_dim, self.vocab_size))
+        self.tok_to_id = {w:i for i,w in enumerate(self.vocab)}
+        self.id_to_tok = dict(enumerate(self.vocab))
+        self.roi = self.rng.uniform(.2,4.8,(self.vocab_size,2))
+        self.vcc, self.high, self.low = 5.,3.,1.5
+        self.tau, self.vth, self.alpha = .0047,.7,.25
+        self.state_dim, self.split = 8,6
+        self.W_main = np.zeros((6,self.vocab_size))
+        self.W_aux = np.zeros((2,self.vocab_size))
+        self.reset()
 
     @staticmethod
-    def tokenize(text):
-        """Generates trigrams from the tokenized text."""
-        tokens = text.split()
-        # Create tuples of 3 consecutive tokens
-        arr = []
-        for i in range(len(tokens) - 2):
-            arr.append(tokens[i] + " " + tokens[i+1] + " " + tokens[i+2])
-        return arr
+    def tokenize(t):
+        w=t.split()
+        return [" ".join(w[i:i+3]) for i in range(len(w)-2)]
 
-    def step_circuit(self, roi_top_v, roi_bot_v, ext_y=0, ext_n=0):
-        """Advances the analog/digital schematic by one timestep (dt)."""
-        self.step_count += 1
-        
-        # 1. DRIVER B (Schmitt Trigger on Top ROI)
-        if roi_top_v >= self.schmitt_high:
-            self.driver_b_state = self.vcc
-        elif roi_top_v <= self.schmitt_low:
-            self.driver_b_state = 0.0
-            
-        # 2. RC INTEGRATOR NODE (R=1k, C=4.7uF)
-        dv_rc = ((self.driver_b_state - self.v_rc) / self.tau_rc) * self.dt
-        self.v_rc += dv_rc
-        
-        # 3. NPN TRANSISTOR THRESHOLD (V_th = 0.7V soft-clamping)
-        if self.v_rc > self.v_th_npn:
-            bleed = (self.v_rc - self.v_th_npn) * 0.65
-            self.v_rc -= bleed
-            v_node_a = self.v_th_npn + (self.v_rc - self.v_th_npn) * 0.2
-        else:
-            v_node_a = self.v_rc
+    def reset(self):
+        self.driver=self.vrc=self.top=self.bot=self.probe=0.
+        self.delay=deque([0]*max(1,int(.010/self.dt)),maxlen=max(1,int(.010/self.dt)))
+        self.dff=self.clock=self.steps=0
 
-        # 4. DRIVER A (Top & Bottom EMA Filters + 0.5V Comparators)
-        self.ema_top = self.ema_alpha * v_node_a + (1 - self.ema_alpha) * self.ema_top
-        self.ema_bot = self.ema_alpha * roi_bot_v + (1 - self.ema_alpha) * self.ema_bot
-        
-        comp_top = 1 if self.ema_top > self.v_ref_comp else 0
-        comp_bot = 1 if self.ema_bot > self.v_ref_comp else 0
-        
-        # 5. MAIN OPTOELECTRONIC AND GATE
-        main_and = comp_top & comp_bot
-        
-        # 6. DELAY LINE (T_dly = 10ms)
-        and_dly = self.delay_line[0]
-        self.delay_line.append(main_and)
-        
-        # 7. OR LOGIC GATES & D FLIP-FLOP (DFF)
-        or_1 = comp_bot | ext_y
-        clk_lw = or_1 | ext_n
-        
-        if clk_lw == 1 and self.prev_clk == 0:
-            self.dff_q = and_dly
-        self.prev_clk = clk_lw
-        
-        # 8. INDEPENDENT SECONDARY PROBE BRANCH
-        raw_top_logic = 1 if roi_top_v > 2.5 else 0
-        sec_and = raw_top_logic & and_dly
-        
-        epsilon = self.rng.normal(0.0, 0.15)
-        probe_prob = np.clip(sec_and * 0.8 + epsilon, 0.0, 1.0)
-        
-        self.probe_accumulator = 0.7 * self.probe_accumulator + 0.3 * probe_prob
-        probe_out = self.probe_accumulator if (self.step_count % 2 == 0) else self.probe_accumulator * 0.5
-            
-        return np.array([
-            self.driver_b_state / self.vcc,
-            self.v_rc / self.v_th_npn,
-            self.ema_top / self.vcc,
-            self.ema_bot / self.vcc,
-            float(main_and),
-            float(and_dly),
-            float(self.dff_q),
-            probe_out
-        ])
+    def step(self,a,b,ext=0):
+        self.steps+=1
+        if a>=self.high:self.driver=5.
+        elif a<=self.low:self.driver=0.
+        self.vrc+=(self.driver-self.vrc)*self.dt/self.tau
+        if self.vrc>self.vth:
+            self.vrc-=.65*(self.vrc-self.vth)
+            node=self.vth+(self.vrc-self.vth)*.2
+        else:node=self.vrc
+        self.top=.25*node+.75*self.top
+        self.bot=.25*b+.75*self.bot
+        ct,cb=int(self.top>.5),int(self.bot>.5)
+        gate=ct&cb
+        delayed=self.delay[0]; self.delay.append(gate)
+        clk=cb|ext
+        if clk and not self.clock:self.dff=delayed
+        self.clock=clk
+        raw_top_logic = int(a > 2.5)
+        sec_and = raw_top_logic & int(delayed)
+        p = np.clip(sec_and * 0.8 + self.rng.normal(0, 0.15), 0.0, 1.0)
+        self.probe=.7*self.probe+.3*p
+        return np.array([self.driver/5,self.vrc/.7,self.top/5,self.bot/5,
+                         gate,delayed,self.dff,self.probe*(1 if self.steps%2==0 else .5)])
 
-    def encode_sequence(self, token_list, ticks_per_word=20):
-        """Feeds a sequence of word tokens through the optical ROIs."""
-        states = []
-        for word in token_list:
-            idx = self.tok_to_id.get(word, 0) # Fallback to 0 if OOV
-            v_top, v_bot = self.roi_embeddings[idx]
-            for t in range(ticks_per_word):
-                noise = self.rng.normal(0, 0.05, size=2)
-                y_pulse = 1 if (t == ticks_per_word // 2) else 0
-                s = self.step_circuit(v_top + noise[0], v_bot + noise[1], ext_y=y_pulse)
-            states.append(s)
-        return np.array(states)
+    def encode(self,tokens,ticks=20):
+        out=[]
+        for word in tokens:
+            a,b=self.roi[self.tok_to_id.get(word,0)]
+            for i in range(ticks):
+                s=self.step(a+self.rng.normal(0,.05),b+self.rng.normal(0,.05),
+                            int(i==ticks//2))
+            out.append(s)
+        return np.array(out).reshape(-1,8)
 
-    def train(self, ridge_alpha=1e-2):
-        """Trains readout weights using word-level transition history."""
-        seq_tokens = self.tokens
-        X = self.encode_sequence(seq_tokens[:-1])
-        Y = np.zeros((len(seq_tokens) - 1, self.vocab_size))
-        
-        for i, target_word in enumerate(seq_tokens[1:]):
-            Y[i, self.tok_to_id[target_word]] = 1.0
-            
-        I = np.eye(self.state_dim)
-        self.W_out = np.linalg.solve(X.T @ X + ridge_alpha * I, X.T @ Y)
+    def ridge(self,datasets,sl,alpha):
+        d=sl.stop-sl.start; A=np.zeros((d,d)); B=np.zeros((d,self.vocab_size))
+        for toks in datasets:
+            if len(toks)<2:continue
+            self.reset(); X=self.encode(toks[:-1])[:,sl]
+            Y=np.zeros((len(toks)-1,self.vocab_size))
+            for i,t in enumerate(toks[1:]):Y[i,self.tok_to_id[t]]=1
+            A+=X.T@X; B+=X.T@Y
+        self.reset()
+        return np.linalg.solve(A+alpha*np.eye(d),B)
 
-    def generate(self, prompt_text, num_words=30, temperature=0.5):
-        """Autoregressively generates subsequent words."""
-        prompt_tokens = self.tokenize(prompt_text)
-        states = self.encode_sequence(prompt_tokens)
-        current_state = states[-1]
-        
-        generated_tokens = list(prompt_tokens)
-        
+    def train(self,alpha=.01):
+        self.W_main=self.ridge([self.primary],slice(0,6),alpha)
+        self.W_aux=self.ridge(self.extras or [self.primary],slice(6,8),alpha)
+        return self
+
+    def probs(self,s,temp=.4):
+        s=np.atleast_2d(s)
+        z=s[:,:6]@self.W_main+s[:,6:]@self.W_aux
+        z=(z-z.max(axis=1,keepdims=True))/np.maximum(.1,temp*(.8+.4*s[:,7,None]))
+        e=np.exp(z); return e/e.sum(axis=1,keepdims=True)
+
+    def generate(self,prompt,num_words=250,temperature=.8):
+        toks=self.tokenize(prompt)
+        if not toks:return ""
+        self.reset(); state=self.encode(toks)[-1]
         for _ in range(num_words):
-            logits = current_state @ self.W_out
-            hw_temp = max(0.1, temperature * (0.8 + 0.4 * current_state[7]))
-            exp_logits = np.exp((logits - np.max(logits)) / hw_temp)
-            probs = exp_logits / np.sum(exp_logits)
-            
-            next_id = self.rng.choice(self.vocab_size, p=probs)
-            next_word = self.id_to_tok[next_id]
-            generated_tokens.append(next_word)
-            
-            current_state = self.encode_sequence([next_word])[-1]
-            
-        # Format output neatly with spacing around punctuation
-        output_str = ""
-        for w in generated_tokens:
-            if re.match(r'[.,;?!:]', w):
-                output_str += w
-            else:
-                output_str += " " + w
-        return output_str.strip()
+            p=self.probs(state,temperature)[0]
+            word=self.id_to_tok[self.rng.choice(self.vocab_size,p=p)]
+            toks.append(word); state=self.encode([word])[-1]
+        return " ".join(toks)
 
-# --- EXAMPLE EXECUTION ---
-if __name__ == "__main__":
-    with open(input("Filename: "), "r", encoding="utf-8") as file:
-        training_corpus = file.read()[:KB_LIMIT]
+# ============================================================
+# 2. H PROPOSITIONS: SYNTACTIC TRANSFORMATION
+# ============================================================
+def h1(t): return t.lower()
+def h2(t): return re.sub(r"[^\w\s']"," ",t)
+def h3(t):
+    w=t.split(); return " ".join(x for i,x in enumerate(w) if not i or x!=w[i-1])
+def h4(t):
+    w=t.split(); o=[]; i=0
+    while i<len(w):
+        if i+3<len(w) and w[i:i+2]==w[i+2:i+4]:o+=w[i:i+2]; i+=4
+        else:o.append(w[i]); i+=1
+    return " ".join(o)
+def h5(t):
+    w=t.split(); c=Counter(w); k=[x for x in w if c[x]>1]
+    return " ".join(k) if k else t
+def h6(t):
+    w=t.split(); c=Counter(w); n=max(1,int(len(c)*.02))
+    k=[x for x in w if x not in {a for a,_ in c.most_common(n)}]
+    return " ".join(k) if k else t
+def h7(t):
+    s=re.split(r"(?<=[.!?])\s+",t)
+    return " ".join(dict.fromkeys(x.strip() for x in s if x.strip()))
 
-    llm = WordOptoelectronicLLM(training_corpus)
-    llm.train()
+H={"H1":h1,"H2":h2,"H3":h3,"H4":h4,"H5":h5,"H6":h6,"H7":h7}
+
+def normal(t): return " ".join(t.split())
+
+def simmer(fn,text,max_iter=100):
+    """Iterate until syntactic stability or resolve a transformation cycle."""
+    current=normal(text); seen={current:0}; history=[current]
+    for i in range(max_iter):
+        nxt=normal(fn(current))
+        if nxt==current:return current,i+1,"SETTLED"
+        if nxt in seen:
+            cycle=history[seen[nxt]:]
+            return min(cycle,key=lambda x:(len(x),x)),i+1,"CYCLE_RESOLVED"
+        seen[nxt]=len(history); history.append(nxt); current=nxt
+    return current,max_iter,"ITERATION_LIMIT"
+
+def build_h():
+    transforms=dict(H)
+    for a,fa in H.items():
+        for b,fb in H.items():
+            if a!=b:transforms[f"{a}>{b}"]=lambda t,fa=fa,fb=fb:fb(fa(t))
+    return transforms
+
+def syntactic_analysis(text):
+    results={}
+    for name,fn in build_h().items():
+        settled,it,status=simmer(fn,text)
+        results[name]={"text":settled,"iterations":it,"status":status}
+    return results
+
+# ============================================================
+# 3. NATURALNESS ASSESSMENT AGAINST ORIGINAL DATA
+# ============================================================
+class NaturalnessAssessor:
+    weights=(.35,.25,.20,.20)
+    def __init__(self,text):
+        w=text[:KB_LIMIT].split(); cut=max(3,int(len(w)*.9))
+        self.train=" ".join(w[:cut]); self.hold=WordOptoelectronicLLM.tokenize(" ".join(w[cut:]))
+        all_t=WordOptoelectronicLLM.tokenize(" ".join(w))
+        self.seen=set(zip(all_t[:-1],all_t[1:]))
+        tr=WordOptoelectronicLLM.tokenize(self.train)
+        self.start=tr[-1] if tr else None
+
+    def assess(self,m,n=80,temp=.4,seed=1234):
+        m.rng=np.random.default_rng(seed); m.reset()
+        X=m.encode(self.hold[:-1]) if len(self.hold)>1 else np.empty((0,8))
+        ll=[]
+        for i,s in enumerate(X):
+            p=m.probs(s,temp)[0]
+            target=m.tok_to_id.get(self.hold[i+1])
+            ll.append(np.log(max(p[target] if target is not None else 0,LL_FLOOR)))
+        likelihood=np.clip(1+np.mean(ll)/np.log(1/LL_FLOOR),0,1) if ll else 0.
+        m.rng=np.random.default_rng(seed+1); m.reset()
+        prev=self.start if self.start in m.tok_to_id else m.vocab[0]
+        state=m.encode([prev])[-1]; gen=[]; seen=coh=0
+        for _ in range(n):
+            p=m.probs(state,temp)[0]; nxt=m.id_to_tok[m.rng.choice(m.vocab_size,p=p)]
+            seen+=(prev,nxt) in self.seen
+            coh+=nxt.split()[:2]==prev.split()[1:]
+            gen.append(nxt); prev=nxt; state=m.encode([nxt])[-1]
+        m.reset(); div=len(set(gen))/max(1,n)
+        seen/=max(1,n); coh/=max(1,n)
+        a,b,c,d=self.weights
+        return dict(likelihood=likelihood,seen=seen,coherence=coh,
+                    diversity=div,composite=a*likelihood+b*seen+c*coh+d*div)
+
+# ============================================================
+# 4. CONTINUOUS SYNTACTIC SIMMERING AND LEARNING
+# ============================================================
+def continuous_train(original,extra_texts=None,max_rounds=100,
+                     explore=.5,tau=.3,ema=.3,min_keep=.5,seed=0):
+    assessor=NaturalnessAssessor(original); rng=np.random.default_rng(seed)
+    primary=normal(assessor.train); extras=[normal(x) for x in (extra_texts or [])]
+    names=list(H); reward={h:0. for h in names}; tries={h:0 for h in names}
+    rejected=set(); history=[]
+    def build(p,e):
+        m=WordOptoelectronicLLM(p,e).train()
+        return m,assessor.assess(m)
+    best,score=build(primary,extras); base=max(1,len(primary.split()))
+    for r in range(max_rounds):
+        logits=np.array([reward[h]+explore/np.sqrt(1+tries[h]) for h in names])
+        p=np.exp((logits-logits.max())/tau); p/=p.sum()
+        h=names[rng.choice(len(names),p=p)]; tries[h]+=1
+        np_,ne=simmer(H[h],primary)[0],[simmer(H[h],x)[0] for x in extras]
+        if np_==primary and ne==extras:continue
+        key=(h,hash(primary))
+        if key in rejected:continue
+        kept=len(np_.split())/base
+        if kept<min_keep:
+            reward[h]=(1-ema)*reward[h]-ema; rejected.add(key); continue
+        model,new=build(np_,ne); delta=new["composite"]-score["composite"]
+        accepted=delta>1e-4
+        reward[h]=(1-ema)*reward[h]+ema*np.tanh(20*delta)
+        history.append(dict(round=r+1,H=h,accepted=accepted,delta=delta,score=new))
+        if accepted:primary,extras,best,score=np_,ne,model,new
+        else:rejected.add(key)
+        print(f"{r+1}: {h} | {delta:+.4f} | {'ACCEPT' if accepted else 'REJECT'}")
+    return best,history,reward
+
+# ============================================================
+# 5. EXECUTION
+# ============================================================
+if __name__=="__main__":
+    with open(input("Primary filename: "),"r",encoding="utf-8") as f:
+        primary=f.read()[:19999]
+    print("\n--- SYNTACTIC SIMMERING ---")
+    for name,result in syntactic_analysis(primary).items():
+        print(name,result["status"],result["iterations"])
+    llm,history,weights=continuous_train(primary,[primary],max_rounds=4)
     while True:
-        output = llm.generate(prompt_text=input("USER: "), num_words=250, temperature=0.4)
-        print("Generated Word Trigram Output:\n", output)
+        prompt=input("\nUSER: ")
+        print("MODEL:",llm.generate(prompt,250,.8))
