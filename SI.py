@@ -191,7 +191,7 @@ class WordOptoelectronicLLM:
 
 # --- EXAMPLE EXECUTION ---
 if __name__ == "__main__":
-    with open("xaa", "r", encoding="utf-8") as file:
+    with open(input("Filename: "), "r", encoding="utf-8") as file:
         training_corpus = file.read()[:KB_LIMIT]
 
     llm = WordOptoelectronicLLM(training_corpus)
