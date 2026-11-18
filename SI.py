@@ -1,10 +1,9 @@
 import numpy as np
-import re
-from collections import Counter, deque
+from collections import deque
 
 KB_LIMIT = 99999
-PRIMARY_FRAC = 0.75
-LL_FLOOR = 1e-6
+PRIMARY_FRAC = 1.75
+LL_FLOOR = 1e-2
 
 
 def V(lam):
@@ -218,142 +217,11 @@ class WordOptoelectronicLLM:
 
 
 # ============================================================
-# 2. H PROPOSITIONS: SYNTACTIC TRANSFORMATION
-# ============================================================
-
-def h1(text):
-    return text.lower()
-
-
-def h2(text):
-    return re.sub(r"[^\w\s']", " ", text)
-
-
-def h3(text):
-    words = text.split()
-    return " ".join(
-        word for i, word in enumerate(words)
-        if i == 0 or word != words[i - 1]
-    )
-
-
-def h4(text):
-    words = text.split()
-    output = []
-    i = 0
-
-    while i < len(words):
-        if (
-            i + 3 < len(words)
-            and words[i:i + 2] == words[i + 2:i + 4]
-        ):
-            output += words[i:i + 2]
-            i += 4
-        else:
-            output.append(words[i])
-            i += 1
-
-    return " ".join(output)
-
-
-def h5(text):
-    words = text.split()
-    counts = Counter(words)
-    repeated = [word for word in words if counts[word] > 1]
-    return " ".join(repeated) if repeated else text
-
-
-def h6(text):
-    words = text.split()
-    counts = Counter(words)
-    number_to_remove = max(1, int(len(counts) * 0.02))
-    common = {word for word, _ in counts.most_common(number_to_remove)}
-    remaining = [word for word in words if word not in common]
-    return " ".join(remaining) if remaining else text
-
-
-def h7(text):
-    sentences = re.split(r"(?<=[.!?])\s+", text)
-    unique = dict.fromkeys(
-        sentence.strip()
-        for sentence in sentences
-        if sentence.strip()
-    )
-    return " ".join(unique)
-
-
-H = {
-    "H1": h1,
-    "H2": h2,
-    "H3": h3,
-    "H4": h4,
-    "H5": h5,
-    "H6": h6,
-    "H7": h7,
-}
-
-
-def normal(text):
-    return " ".join(text.split())
-
-
-def simmer(fn, text, max_iter=100):
-    """Iterate a transformation until stable or resolve a detected cycle."""
-    current = normal(text)
-    seen = {current: 0}
-    history = [current]
-
-    for iteration in range(max_iter):
-        next_text = normal(fn(current))
-
-        if next_text == current:
-            return current, iteration + 1, "SETTLED"
-
-        if next_text in seen:
-            cycle = history[seen[next_text]:]
-            settled = min(cycle, key=lambda item: (len(item), item))
-            return settled, iteration + 1, "CYCLE_RESOLVED"
-
-        seen[next_text] = len(history)
-        history.append(next_text)
-        current = next_text
-
-    return current, max_iter, "ITERATION_LIMIT"
-
-
-def build_h():
-    transforms = dict(H)
-
-    for name_a, fn_a in H.items():
-        for name_b, fn_b in H.items():
-            if name_a != name_b:
-                transforms[f"{name_a}>{name_b}"] = (
-                    lambda text, fa=fn_a, fb=fn_b: fb(fa(text))
-                )
-
-    return transforms
-
-
-def syntactic_analysis(text):
-    results = {}
-
-    for name, transform in build_h().items():
-        settled, iterations, status = simmer(transform, text)
-        results[name] = {
-            "text": settled,
-            "iterations": iterations,
-            "status": status,
-        }
-
-    return results
-
-
-# ============================================================
-# 3. NATURALNESS ASSESSMENT AGAINST ORIGINAL DATA
+# 2. NATURALNESS ASSESSMENT AGAINST ORIGINAL DATA
 # ============================================================
 
 class NaturalnessAssessor:
-    weights = (0.35, 0.25, 0.20, 0.20)
+    weights = (0.65, 0.25, 0.20, 0.20)
 
     def __init__(self, text):
         words = text[:KB_LIMIT].split()
@@ -466,113 +334,7 @@ class NaturalnessAssessor:
 
 
 # ============================================================
-# 4. CONTINUOUS SYNTACTIC SIMMERING AND LEARNING
-# ============================================================
-
-def continuous_train(
-    original,
-    extra_texts=None,
-    max_rounds=100,
-    explore=0.5,
-    tau=0.3,
-    ema=0.3,
-    min_keep=0.5,
-    seed=0,
-):
-    assessor = NaturalnessAssessor(original)
-    rng = np.random.default_rng(seed)
-
-    primary = normal(assessor.train)
-    extras = [normal(text) for text in (extra_texts or [])]
-
-    names = list(H)
-    reward = {name: 0.0 for name in names}
-    tries = {name: 0 for name in names}
-
-    rejected = set()
-    history = []
-
-    def build(primary_text, extra_text):
-        model = WordOptoelectronicLLM(
-            primary_text, extra_text
-        ).train()
-        return model, assessor.assess(model)
-
-    best_model, score = build(primary, extras)
-    base_length = max(1, len(primary.split()))
-
-    for round_index in range(max_rounds):
-        logits = np.array([
-            reward[name] + explore / np.sqrt(1 + tries[name])
-            for name in names
-        ])
-
-        probabilities = np.exp(
-            (logits - logits.max()) / max(tau, 1e-6)
-        )
-        probabilities /= probabilities.sum()
-
-        chosen_h = names[rng.choice(len(names), p=probabilities)]
-        tries[chosen_h] += 1
-
-        new_primary = simmer(H[chosen_h], primary)[0]
-        new_extras = [
-            simmer(H[chosen_h], text)[0]
-            for text in extras
-        ]
-
-        if new_primary == primary and new_extras == extras:
-            continue
-
-        key = (chosen_h, new_primary, tuple(new_extras))
-        if key in rejected:
-            continue
-
-        retained = len(new_primary.split()) / base_length
-        if retained < min_keep:
-            reward[chosen_h] = (
-                (1.0 - ema) * reward[chosen_h] - ema
-            )
-            rejected.add(key)
-            continue
-
-        model, new_score = build(new_primary, new_extras)
-        delta = new_score["composite"] - score["composite"]
-        accepted = delta > 1e-4
-
-        reward[chosen_h] = (
-            (1.0 - ema) * reward[chosen_h]
-            + ema * np.tanh(20.0 * delta)
-        )
-
-        history.append({
-            "round": round_index + 1,
-            "H": chosen_h,
-            "accepted": accepted,
-            "delta": float(delta),
-            "score": new_score,
-        })
-
-        if accepted:
-            primary = new_primary
-            extras = new_extras
-            best_model = model
-            score = new_score
-            base_length = max(1, len(primary.split()))
-        else:
-            rejected.add(key)
-
-        print(
-            f"{round_index + 1}: {chosen_h} | "
-            f"{delta:+.4f} | "
-            f"{'ACCEPT' if accepted else 'REJECT'}"
-        )
-
-    return best_model, history, reward
-
-
-# ============================================================
-# 5. EXECUTION
+# 3. EXECUTION
 # ============================================================
 
 def main():
@@ -589,39 +351,32 @@ def main():
         print("Please provide a source file containing at least six words.")
         return
 
-    print("\n--- SYNTACTIC SIMMERING ---")
-    for name, result in syntactic_analysis(primary).items():
-        print(
-            f"{name:8s} {result['status']:16s} "
-            f"{result['iterations']} iterations"
-        )
+    print("\\n--- TRAINING ---")
+    model = WordOptoelectronicLLM(primary, [primary]).train()
 
-    print("\n--- CONTINUOUS TRAINING ---")
-    model, history, rewards = continuous_train(
-        primary,
-        [primary],
-        max_rounds=4,
-    )
+    print("\\n--- NATURALNESS ASSESSMENT ---")
+    assessor = NaturalnessAssessor(primary)
+    scores = assessor.assess(model)
+    for name, value in scores.items():
+        print(f"{name}: {value:.4f}")
 
-    print("\n--- MODEL READY ---")
+    print("\\n--- MODEL READY ---")
     print("Vector operator: V(lambda) = sign(lambda) * abs(lambda)**(1/5)")
-    print("Enter a prompt using words found in the training corpus.")
     print("Type /quit to stop.")
 
     while True:
         try:
-            prompt = input("\nUSER: ").strip()
+            prompt = input("\\nUSER: ").strip()
         except (EOFError, KeyboardInterrupt):
-            print("\nExiting.")
+            print("\\nExiting.")
             break
 
         if prompt.lower() in {"/quit", "quit", "exit"}:
             break
-
         if not prompt:
             continue
 
-        print("MODEL:", model.generate(prompt, 250, 0.8))
+        print("MODEL:", model.generate(prompt, 250, 10.0))
 
 
 if __name__ == "__main__":
