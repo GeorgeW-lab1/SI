@@ -2,7 +2,7 @@
 import numpy as np, re
 from collections import Counter, deque
 
-KB_LIMIT, PRIMARY_FRAC = 99999, 0.75
+KB_LIMIT, PRIMARY_FRAC = 99999, 1.75
 LL_FLOOR = 1e-6
 
 # ============================================================
