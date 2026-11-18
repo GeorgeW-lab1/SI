@@ -1,7 +1,7 @@
 import numpy as np
 import re
 from collections import deque
-
+KB_LIMIT = -1
 class WordOptoelectronicLLM:
     def __init__(self, corpus, dt=0.001, seed=42):
         """
@@ -192,10 +192,10 @@ class WordOptoelectronicLLM:
 # --- EXAMPLE EXECUTION ---
 if __name__ == "__main__":
     with open("xaa", "r", encoding="utf-8") as file:
-        training_corpus = file.read()[:99999]
+        training_corpus = file.read()[:KB_LIMIT]
 
     llm = WordOptoelectronicLLM(training_corpus)
     llm.train()
-    
-    output = llm.generate(prompt_text="the truth is", num_words=250, temperature=0.4)
-    print("Generated Word Trigram Output:\n", output)
+    while True:
+        output = llm.generate(prompt_text=input("USER: "), num_words=250, temperature=0.4)
+        print("Generated Word Trigram Output:\n", output)
