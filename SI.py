@@ -2,7 +2,7 @@
 import numpy as np, re
 from collections import Counter, deque
 
-KB_LIMIT, PRIMARY_FRAC = 99999, 1.75
+KB_LIMIT, PRIMARY_FRAC = 19999, 1.75
 LL_FLOOR = 1e-6
 
 # ============================================================
@@ -231,7 +231,7 @@ def continuous_train(original,extra_texts=None,max_rounds=100,
 # ============================================================
 if __name__=="__main__":
     with open(input("Primary filename: "),"r",encoding="utf-8") as f:
-        primary=f.read()[:19999]
+        primary=f.read()[:KB_LIMIT]
     print("\n--- SYNTACTIC SIMMERING ---")
     for name,result in syntactic_analysis(primary).items():
         print(name,result["status"],result["iterations"])
