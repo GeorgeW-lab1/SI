@@ -1,241 +1,628 @@
-
-import numpy as np, re
+import numpy as np
+import re
 from collections import Counter, deque
 
-KB_LIMIT, PRIMARY_FRAC = 19999, 1.75
+KB_LIMIT = 99999
+PRIMARY_FRAC = 0.75
 LL_FLOOR = 1e-6
+
+
+def V(lam):
+    """Element-wise real fifth-root vector operator."""
+    lam = np.asarray(lam, dtype=float)
+    return np.sign(lam) * np.abs(lam) ** 0.2
+
 
 # ============================================================
 # 1. OPTOELECTRONIC RESERVOIR
 # ============================================================
+
 class WordOptoelectronicLLM:
-    def __init__(self, corpus, extra_corpora=None, dt=.001, seed=42):
-        self.rng, self.dt = np.random.default_rng(seed), dt
-        self.raw = [corpus[:KB_LIMIT]] + [(x[:KB_LIMIT]) for x in (extra_corpora or [])]
+    def __init__(self, corpus, extra_corpora=None, dt=0.001, seed=42):
+        self.rng = np.random.default_rng(seed)
+        self.dt = float(dt)
+
+        self.raw = [corpus[:KB_LIMIT]]
+        self.raw += [x[:KB_LIMIT] for x in (extra_corpora or [])]
+
         self.primary = self.tokenize(self.raw[0])
         self.extras = [self.tokenize(x) for x in self.raw[1:]]
-        self.extras = [x for x in self.extras if x]
-        self.vocab = sorted(set(t for ds in [self.primary]+self.extras for t in ds))
+        self.extras = [tokens for tokens in self.extras if tokens]
+
+        datasets = [self.primary] + self.extras
+        self.vocab = sorted(set(token for data in datasets for token in data))
+        if not self.vocab:
+            raise ValueError(
+                "The corpus must contain at least three whitespace-separated words."
+            )
+
         self.vocab_size = len(self.vocab)
-        self.tok_to_id = {w:i for i,w in enumerate(self.vocab)}
+        self.tok_to_id = {word: i for i, word in enumerate(self.vocab)}
         self.id_to_tok = dict(enumerate(self.vocab))
-        self.roi = self.rng.uniform(.2,4.8,(self.vocab_size,2))
-        self.vcc, self.high, self.low = 5.,3.,1.5
-        self.tau, self.vth, self.alpha = .0047,.7,.25
-        self.state_dim, self.split = 8,6
-        self.W_main = np.zeros((6,self.vocab_size))
-        self.W_aux = np.zeros((2,self.vocab_size))
+
+        self.roi = self.rng.uniform(0.2, 4.8, (self.vocab_size, 2))
+
+        self.vcc = 5.0
+        self.high = 3.0
+        self.low = 1.5
+        self.tau = 0.0047
+        self.vth = 0.7
+        self.alpha = 0.25
+
+        self.state_dim = 8
+        self.split = 6
+        self.W_main = np.zeros((6, self.vocab_size))
+        self.W_aux = np.zeros((2, self.vocab_size))
         self.reset()
 
     @staticmethod
-    def tokenize(t):
-        w=t.split()
-        return [" ".join(w[i:i+3]) for i in range(len(w)-2)]
+    def tokenize(text):
+        words = text.split()
+        return [" ".join(words[i:i + 3]) for i in range(len(words) - 2)]
 
     def reset(self):
-        self.driver=self.vrc=self.top=self.bot=self.probe=0.
-        self.delay=deque([0]*max(1,int(.010/self.dt)),maxlen=max(1,int(.010/self.dt)))
-        self.dff=self.clock=self.steps=0
+        self.driver = 0.0
+        self.vrc = 0.0
+        self.top = 0.0
+        self.bot = 0.0
+        self.probe = 0.0
 
-    def step(self,a,b,ext=0):
-        self.steps+=1
-        if a>=self.high:self.driver=5.
-        elif a<=self.low:self.driver=0.
-        self.vrc+=(self.driver-self.vrc)*self.dt/self.tau
-        if self.vrc>self.vth:
-            self.vrc-=.65*(self.vrc-self.vth)
-            node=self.vth+(self.vrc-self.vth)*.2
-        else:node=self.vrc
-        self.top=.25*node+.75*self.top
-        self.bot=.25*b+.75*self.bot
-        ct,cb=int(self.top>.5),int(self.bot>.5)
-        gate=ct&cb
-        delayed=self.delay[0]; self.delay.append(gate)
-        clk=cb|ext
-        if clk and not self.clock:self.dff=delayed
-        self.clock=clk
+        delay_length = max(1, int(0.010 / self.dt))
+        self.delay = deque([0] * delay_length, maxlen=delay_length)
+
+        self.dff = 0
+        self.clock = 0
+        self.steps = 0
+
+    def step(self, a, b, ext=0):
+        self.steps += 1
+
+        # Hysteretic driver.
+        if a >= self.high:
+            self.driver = 5.0
+        elif a <= self.low:
+            self.driver = 0.0
+
+        # RC reservoir response.
+        self.vrc += (self.driver - self.vrc) * self.dt / self.tau
+
+        if self.vrc > self.vth:
+            self.vrc -= 0.65 * (self.vrc - self.vth)
+            node = self.vth + (self.vrc - self.vth) * 0.2
+        else:
+            node = self.vrc
+
+        self.top = 0.25 * node + 0.75 * self.top
+        self.bot = 0.25 * b + 0.75 * self.bot
+
+        ct = int(self.top > 0.5)
+        cb = int(self.bot > 0.5)
+        gate = ct & cb
+
+        delayed = self.delay[0]
+        self.delay.append(gate)
+
+        clk = cb | int(bool(ext))
+        if clk and not self.clock:
+            self.dff = delayed
+        self.clock = clk
+
+        # Keep bitwise logic integer-only; convert to float afterward.
         raw_top_logic = int(a > 2.5)
         sec_and = raw_top_logic & int(delayed)
-        p = np.clip(sec_and * 0.8 + self.rng.normal(0, 0.15), 0.0, 1.0)
-        self.probe=.7*self.probe+.3*p
-        return np.array([self.driver/5,self.vrc/.7,self.top/5,self.bot/5,
-                         gate,delayed,self.dff,self.probe*(1 if self.steps%2==0 else .5)])
+        probability = np.clip(
+            sec_and * 0.8 + self.rng.normal(0.0, 0.15), 0.0, 1.0
+        )
+        self.probe = 0.7 * self.probe + 0.3 * probability
 
-    def encode(self,tokens,ticks=20):
-        out=[]
-        for word in tokens:
-            a,b=self.roi[self.tok_to_id.get(word,0)]
-            for i in range(ticks):
-                s=self.step(a+self.rng.normal(0,.05),b+self.rng.normal(0,.05),
-                            int(i==ticks//2))
-            out.append(s)
-        return np.array(out).reshape(-1,8)
+        state = np.array([
+            self.driver / 5.0,
+            self.vrc / 0.7,
+            self.top / 5.0,
+            self.bot / 5.0,
+            gate,
+            delayed,
+            self.dff,
+            self.probe * (1.0 if self.steps % 2 == 0 else 0.5),
+        ], dtype=float)
 
-    def ridge(self,datasets,sl,alpha):
-        d=sl.stop-sl.start; A=np.zeros((d,d)); B=np.zeros((d,self.vocab_size))
-        for toks in datasets:
-            if len(toks)<2:continue
-            self.reset(); X=self.encode(toks[:-1])[:,sl]
-            Y=np.zeros((len(toks)-1,self.vocab_size))
-            for i,t in enumerate(toks[1:]):Y[i,self.tok_to_id[t]]=1
-            A+=X.T@X; B+=X.T@Y
+        # Apply the fifth-root vector operator to every reservoir state.
+        return V(state)
+
+    def encode(self, tokens, ticks=20):
+        output = []
+
+        for token in tokens:
+            token_id = self.tok_to_id.get(token, 0)
+            a, b = self.roi[token_id]
+
+            state = np.zeros(self.state_dim)
+            for tick in range(ticks):
+                state = self.step(
+                    a + self.rng.normal(0.0, 0.05),
+                    b + self.rng.normal(0.0, 0.05),
+                    int(tick == ticks // 2),
+                )
+            output.append(state)
+
+        return np.asarray(output, dtype=float).reshape(-1, self.state_dim)
+
+    def ridge(self, datasets, state_slice, alpha):
+        dimension = state_slice.stop - state_slice.start
+        gram = np.zeros((dimension, dimension))
+        cross = np.zeros((dimension, self.vocab_size))
+
+        for tokens in datasets:
+            if len(tokens) < 2:
+                continue
+
+            self.reset()
+            X = self.encode(tokens[:-1])[:, state_slice]
+
+            Y = np.zeros((len(tokens) - 1, self.vocab_size))
+            for i, token in enumerate(tokens[1:]):
+                Y[i, self.tok_to_id[token]] = 1.0
+
+            gram += X.T @ X
+            cross += X.T @ Y
+
         self.reset()
-        return np.linalg.solve(A+alpha*np.eye(d),B)
+        return np.linalg.solve(
+            gram + alpha * np.eye(dimension),
+            cross
+        )
 
-    def train(self,alpha=.01):
-        self.W_main=self.ridge([self.primary],slice(0,6),alpha)
-        self.W_aux=self.ridge(self.extras or [self.primary],slice(6,8),alpha)
+    def train(self, alpha=0.01):
+        self.W_main = self.ridge(
+            [self.primary], slice(0, 6), alpha
+        )
+        self.W_aux = self.ridge(
+            self.extras or [self.primary], slice(6, 8), alpha
+        )
         return self
 
-    def probs(self,s,temp=.4):
-        s=np.atleast_2d(s)
-        z=s[:,:6]@self.W_main+s[:,6:]@self.W_aux
-        z=(z-z.max(axis=1,keepdims=True))/np.maximum(.1,temp*(.8+.4*s[:,7,None]))
-        e=np.exp(z); return e/e.sum(axis=1,keepdims=True)
+    def probs(self, state, temp=0.4):
+        state = np.atleast_2d(state)
 
-    def generate(self,prompt,num_words=250,temperature=.8):
-        toks=self.tokenize(prompt)
-        if not toks:return ""
-        self.reset(); state=self.encode(toks)[-1]
+        logits = (
+            state[:, :6] @ self.W_main
+            + state[:, 6:] @ self.W_aux
+        )
+
+        scale = np.maximum(
+            0.1,
+            temp * (0.8 + 0.4 * state[:, 7, None])
+        )
+        logits = (logits - logits.max(axis=1, keepdims=True)) / scale
+
+        exp_logits = np.exp(logits)
+        return exp_logits / exp_logits.sum(axis=1, keepdims=True)
+
+    def generate(self, prompt, num_words=250, temperature=0.8):
+        tokens = self.tokenize(prompt)
+        if not tokens:
+            return prompt
+
+        self.reset()
+        state = self.encode(tokens)[-1]
+
         for _ in range(num_words):
-            p=self.probs(state,temperature)[0]
-            word=self.id_to_tok[self.rng.choice(self.vocab_size,p=p)]
-            toks.append(word); state=self.encode([word])[-1]
-        return " ".join(toks)
+            probabilities = self.probs(state, temperature)[0]
+            next_token = self.id_to_tok[
+                self.rng.choice(self.vocab_size, p=probabilities)
+            ]
+            tokens.append(next_token)
+            state = self.encode([next_token])[-1]
+
+        return " ".join(tokens)
+
 
 # ============================================================
 # 2. H PROPOSITIONS: SYNTACTIC TRANSFORMATION
 # ============================================================
-def h1(t): return t.lower()
-def h2(t): return re.sub(r"[^\w\s']"," ",t)
-def h3(t):
-    w=t.split(); return " ".join(x for i,x in enumerate(w) if not i or x!=w[i-1])
-def h4(t):
-    w=t.split(); o=[]; i=0
-    while i<len(w):
-        if i+3<len(w) and w[i:i+2]==w[i+2:i+4]:o+=w[i:i+2]; i+=4
-        else:o.append(w[i]); i+=1
-    return " ".join(o)
-def h5(t):
-    w=t.split(); c=Counter(w); k=[x for x in w if c[x]>1]
-    return " ".join(k) if k else t
-def h6(t):
-    w=t.split(); c=Counter(w); n=max(1,int(len(c)*.02))
-    k=[x for x in w if x not in {a for a,_ in c.most_common(n)}]
-    return " ".join(k) if k else t
-def h7(t):
-    s=re.split(r"(?<=[.!?])\s+",t)
-    return " ".join(dict.fromkeys(x.strip() for x in s if x.strip()))
 
-H={"H1":h1,"H2":h2,"H3":h3,"H4":h4,"H5":h5,"H6":h6,"H7":h7}
+def h1(text):
+    return text.lower()
 
-def normal(t): return " ".join(t.split())
 
-def simmer(fn,text,max_iter=100):
-    """Iterate until syntactic stability or resolve a transformation cycle."""
-    current=normal(text); seen={current:0}; history=[current]
-    for i in range(max_iter):
-        nxt=normal(fn(current))
-        if nxt==current:return current,i+1,"SETTLED"
-        if nxt in seen:
-            cycle=history[seen[nxt]:]
-            return min(cycle,key=lambda x:(len(x),x)),i+1,"CYCLE_RESOLVED"
-        seen[nxt]=len(history); history.append(nxt); current=nxt
-    return current,max_iter,"ITERATION_LIMIT"
+def h2(text):
+    return re.sub(r"[^\w\s']", " ", text)
+
+
+def h3(text):
+    words = text.split()
+    return " ".join(
+        word for i, word in enumerate(words)
+        if i == 0 or word != words[i - 1]
+    )
+
+
+def h4(text):
+    words = text.split()
+    output = []
+    i = 0
+
+    while i < len(words):
+        if (
+            i + 3 < len(words)
+            and words[i:i + 2] == words[i + 2:i + 4]
+        ):
+            output += words[i:i + 2]
+            i += 4
+        else:
+            output.append(words[i])
+            i += 1
+
+    return " ".join(output)
+
+
+def h5(text):
+    words = text.split()
+    counts = Counter(words)
+    repeated = [word for word in words if counts[word] > 1]
+    return " ".join(repeated) if repeated else text
+
+
+def h6(text):
+    words = text.split()
+    counts = Counter(words)
+    number_to_remove = max(1, int(len(counts) * 0.02))
+    common = {word for word, _ in counts.most_common(number_to_remove)}
+    remaining = [word for word in words if word not in common]
+    return " ".join(remaining) if remaining else text
+
+
+def h7(text):
+    sentences = re.split(r"(?<=[.!?])\s+", text)
+    unique = dict.fromkeys(
+        sentence.strip()
+        for sentence in sentences
+        if sentence.strip()
+    )
+    return " ".join(unique)
+
+
+H = {
+    "H1": h1,
+    "H2": h2,
+    "H3": h3,
+    "H4": h4,
+    "H5": h5,
+    "H6": h6,
+    "H7": h7,
+}
+
+
+def normal(text):
+    return " ".join(text.split())
+
+
+def simmer(fn, text, max_iter=100):
+    """Iterate a transformation until stable or resolve a detected cycle."""
+    current = normal(text)
+    seen = {current: 0}
+    history = [current]
+
+    for iteration in range(max_iter):
+        next_text = normal(fn(current))
+
+        if next_text == current:
+            return current, iteration + 1, "SETTLED"
+
+        if next_text in seen:
+            cycle = history[seen[next_text]:]
+            settled = min(cycle, key=lambda item: (len(item), item))
+            return settled, iteration + 1, "CYCLE_RESOLVED"
+
+        seen[next_text] = len(history)
+        history.append(next_text)
+        current = next_text
+
+    return current, max_iter, "ITERATION_LIMIT"
+
 
 def build_h():
-    transforms=dict(H)
-    for a,fa in H.items():
-        for b,fb in H.items():
-            if a!=b:transforms[f"{a}>{b}"]=lambda t,fa=fa,fb=fb:fb(fa(t))
+    transforms = dict(H)
+
+    for name_a, fn_a in H.items():
+        for name_b, fn_b in H.items():
+            if name_a != name_b:
+                transforms[f"{name_a}>{name_b}"] = (
+                    lambda text, fa=fn_a, fb=fn_b: fb(fa(text))
+                )
+
     return transforms
 
+
 def syntactic_analysis(text):
-    results={}
-    for name,fn in build_h().items():
-        settled,it,status=simmer(fn,text)
-        results[name]={"text":settled,"iterations":it,"status":status}
+    results = {}
+
+    for name, transform in build_h().items():
+        settled, iterations, status = simmer(transform, text)
+        results[name] = {
+            "text": settled,
+            "iterations": iterations,
+            "status": status,
+        }
+
     return results
+
 
 # ============================================================
 # 3. NATURALNESS ASSESSMENT AGAINST ORIGINAL DATA
 # ============================================================
-class NaturalnessAssessor:
-    weights=(.35,.25,.20,.20)
-    def __init__(self,text):
-        w=text[:KB_LIMIT].split(); cut=max(3,int(len(w)*.9))
-        self.train=" ".join(w[:cut]); self.hold=WordOptoelectronicLLM.tokenize(" ".join(w[cut:]))
-        all_t=WordOptoelectronicLLM.tokenize(" ".join(w))
-        self.seen=set(zip(all_t[:-1],all_t[1:]))
-        tr=WordOptoelectronicLLM.tokenize(self.train)
-        self.start=tr[-1] if tr else None
 
-    def assess(self,m,n=80,temp=.4,seed=1234):
-        m.rng=np.random.default_rng(seed); m.reset()
-        X=m.encode(self.hold[:-1]) if len(self.hold)>1 else np.empty((0,8))
-        ll=[]
-        for i,s in enumerate(X):
-            p=m.probs(s,temp)[0]
-            target=m.tok_to_id.get(self.hold[i+1])
-            ll.append(np.log(max(p[target] if target is not None else 0,LL_FLOOR)))
-        likelihood=np.clip(1+np.mean(ll)/np.log(1/LL_FLOOR),0,1) if ll else 0.
-        m.rng=np.random.default_rng(seed+1); m.reset()
-        prev=self.start if self.start in m.tok_to_id else m.vocab[0]
-        state=m.encode([prev])[-1]; gen=[]; seen=coh=0
+class NaturalnessAssessor:
+    weights = (0.35, 0.25, 0.20, 0.20)
+
+    def __init__(self, text):
+        words = text[:KB_LIMIT].split()
+        if len(words) < 6:
+            raise ValueError(
+                "Naturalness assessment needs at least six words of source text."
+            )
+
+        cut = max(3, int(len(words) * 0.9))
+        cut = min(cut, len(words) - 3)
+
+        self.train = " ".join(words[:cut])
+        self.hold = WordOptoelectronicLLM.tokenize(" ".join(words[cut:]))
+
+        all_tokens = WordOptoelectronicLLM.tokenize(" ".join(words))
+        self.seen = set(zip(all_tokens[:-1], all_tokens[1:]))
+
+        training_tokens = WordOptoelectronicLLM.tokenize(self.train)
+        self.start = training_tokens[-1] if training_tokens else None
+
+    def assess(self, model, n=80, temp=0.4, seed=1234):
+        if not model.vocab:
+            return {
+                "likelihood": 0.0,
+                "seen": 0.0,
+                "coherence": 0.0,
+                "diversity": 0.0,
+                "composite": 0.0,
+            }
+
+        model.rng = np.random.default_rng(seed)
+        model.reset()
+
+        X = (
+            model.encode(self.hold[:-1])
+            if len(self.hold) > 1
+            else np.empty((0, 8))
+        )
+
+        log_likelihoods = []
+        for i, state in enumerate(X):
+            probabilities = model.probs(state, temp)[0]
+            target = model.tok_to_id.get(self.hold[i + 1])
+            target_probability = (
+                probabilities[target] if target is not None else 0.0
+            )
+            log_likelihoods.append(
+                np.log(max(target_probability, LL_FLOOR))
+            )
+
+        likelihood = (
+            np.clip(
+                1.0 + np.mean(log_likelihoods) / np.log(1.0 / LL_FLOOR),
+                0.0,
+                1.0,
+            )
+            if log_likelihoods else 0.0
+        )
+
+        model.rng = np.random.default_rng(seed + 1)
+        model.reset()
+
+        previous = (
+            self.start
+            if self.start in model.tok_to_id
+            else model.vocab[0]
+        )
+        state = model.encode([previous])[-1]
+
+        generated = []
+        seen_count = 0
+        coherence_count = 0
+
         for _ in range(n):
-            p=m.probs(state,temp)[0]; nxt=m.id_to_tok[m.rng.choice(m.vocab_size,p=p)]
-            seen+=(prev,nxt) in self.seen
-            coh+=nxt.split()[:2]==prev.split()[1:]
-            gen.append(nxt); prev=nxt; state=m.encode([nxt])[-1]
-        m.reset(); div=len(set(gen))/max(1,n)
-        seen/=max(1,n); coh/=max(1,n)
-        a,b,c,d=self.weights
-        return dict(likelihood=likelihood,seen=seen,coherence=coh,
-                    diversity=div,composite=a*likelihood+b*seen+c*coh+d*div)
+            probabilities = model.probs(state, temp)[0]
+            next_token = model.id_to_tok[
+                model.rng.choice(model.vocab_size, p=probabilities)
+            ]
+
+            seen_count += (previous, next_token) in self.seen
+            coherence_count += (
+                next_token.split()[:2] == previous.split()[1:]
+            )
+
+            generated.append(next_token)
+            previous = next_token
+            state = model.encode([next_token])[-1]
+
+        model.reset()
+
+        diversity = len(set(generated)) / max(1, n)
+        seen_score = seen_count / max(1, n)
+        coherence = coherence_count / max(1, n)
+
+        a, b, c, d = self.weights
+        composite = (
+            a * likelihood
+            + b * seen_score
+            + c * coherence
+            + d * diversity
+        )
+
+        return {
+            "likelihood": float(likelihood),
+            "seen": float(seen_score),
+            "coherence": float(coherence),
+            "diversity": float(diversity),
+            "composite": float(composite),
+        }
+
 
 # ============================================================
 # 4. CONTINUOUS SYNTACTIC SIMMERING AND LEARNING
 # ============================================================
-def continuous_train(original,extra_texts=None,max_rounds=100,
-                     explore=.5,tau=.3,ema=.3,min_keep=.5,seed=0):
-    assessor=NaturalnessAssessor(original); rng=np.random.default_rng(seed)
-    primary=normal(assessor.train); extras=[normal(x) for x in (extra_texts or [])]
-    names=list(H); reward={h:0. for h in names}; tries={h:0 for h in names}
-    rejected=set(); history=[]
-    def build(p,e):
-        m=WordOptoelectronicLLM(p,e).train()
-        return m,assessor.assess(m)
-    best,score=build(primary,extras); base=max(1,len(primary.split()))
-    for r in range(max_rounds):
-        logits=np.array([reward[h]+explore/np.sqrt(1+tries[h]) for h in names])
-        p=np.exp((logits-logits.max())/tau); p/=p.sum()
-        h=names[rng.choice(len(names),p=p)]; tries[h]+=1
-        np_,ne=simmer(H[h],primary)[0],[simmer(H[h],x)[0] for x in extras]
-        if np_==primary and ne==extras:continue
-        key=(h,hash(primary))
-        if key in rejected:continue
-        kept=len(np_.split())/base
-        if kept<min_keep:
-            reward[h]=(1-ema)*reward[h]-ema; rejected.add(key); continue
-        model,new=build(np_,ne); delta=new["composite"]-score["composite"]
-        accepted=delta>1e-4
-        reward[h]=(1-ema)*reward[h]+ema*np.tanh(20*delta)
-        history.append(dict(round=r+1,H=h,accepted=accepted,delta=delta,score=new))
-        if accepted:primary,extras,best,score=np_,ne,model,new
-        else:rejected.add(key)
-        print(f"{r+1}: {h} | {delta:+.4f} | {'ACCEPT' if accepted else 'REJECT'}")
-    return best,history,reward
+
+def continuous_train(
+    original,
+    extra_texts=None,
+    max_rounds=100,
+    explore=0.5,
+    tau=0.3,
+    ema=0.3,
+    min_keep=0.5,
+    seed=0,
+):
+    assessor = NaturalnessAssessor(original)
+    rng = np.random.default_rng(seed)
+
+    primary = normal(assessor.train)
+    extras = [normal(text) for text in (extra_texts or [])]
+
+    names = list(H)
+    reward = {name: 0.0 for name in names}
+    tries = {name: 0 for name in names}
+
+    rejected = set()
+    history = []
+
+    def build(primary_text, extra_text):
+        model = WordOptoelectronicLLM(
+            primary_text, extra_text
+        ).train()
+        return model, assessor.assess(model)
+
+    best_model, score = build(primary, extras)
+    base_length = max(1, len(primary.split()))
+
+    for round_index in range(max_rounds):
+        logits = np.array([
+            reward[name] + explore / np.sqrt(1 + tries[name])
+            for name in names
+        ])
+
+        probabilities = np.exp(
+            (logits - logits.max()) / max(tau, 1e-6)
+        )
+        probabilities /= probabilities.sum()
+
+        chosen_h = names[rng.choice(len(names), p=probabilities)]
+        tries[chosen_h] += 1
+
+        new_primary = simmer(H[chosen_h], primary)[0]
+        new_extras = [
+            simmer(H[chosen_h], text)[0]
+            for text in extras
+        ]
+
+        if new_primary == primary and new_extras == extras:
+            continue
+
+        key = (chosen_h, new_primary, tuple(new_extras))
+        if key in rejected:
+            continue
+
+        retained = len(new_primary.split()) / base_length
+        if retained < min_keep:
+            reward[chosen_h] = (
+                (1.0 - ema) * reward[chosen_h] - ema
+            )
+            rejected.add(key)
+            continue
+
+        model, new_score = build(new_primary, new_extras)
+        delta = new_score["composite"] - score["composite"]
+        accepted = delta > 1e-4
+
+        reward[chosen_h] = (
+            (1.0 - ema) * reward[chosen_h]
+            + ema * np.tanh(20.0 * delta)
+        )
+
+        history.append({
+            "round": round_index + 1,
+            "H": chosen_h,
+            "accepted": accepted,
+            "delta": float(delta),
+            "score": new_score,
+        })
+
+        if accepted:
+            primary = new_primary
+            extras = new_extras
+            best_model = model
+            score = new_score
+            base_length = max(1, len(primary.split()))
+        else:
+            rejected.add(key)
+
+        print(
+            f"{round_index + 1}: {chosen_h} | "
+            f"{delta:+.4f} | "
+            f"{'ACCEPT' if accepted else 'REJECT'}"
+        )
+
+    return best_model, history, reward
+
 
 # ============================================================
 # 5. EXECUTION
 # ============================================================
-if __name__=="__main__":
-    with open(input("Primary filename: "),"r",encoding="utf-8") as f:
-        primary=f.read()[:KB_LIMIT]
+
+def main():
+    filename = input("Primary filename: ").strip()
+
+    try:
+        with open(filename, "r", encoding="utf-8") as file:
+            primary = file.read()[:KB_LIMIT]
+    except OSError as error:
+        print(f"Could not open file: {error}")
+        return
+
+    if len(primary.split()) < 6:
+        print("Please provide a source file containing at least six words.")
+        return
+
     print("\n--- SYNTACTIC SIMMERING ---")
-    for name,result in syntactic_analysis(primary).items():
-        print(name,result["status"],result["iterations"])
-    llm,history,weights=continuous_train(primary,[primary],max_rounds=4)
+    for name, result in syntactic_analysis(primary).items():
+        print(
+            f"{name:8s} {result['status']:16s} "
+            f"{result['iterations']} iterations"
+        )
+
+    print("\n--- CONTINUOUS TRAINING ---")
+    model, history, rewards = continuous_train(
+        primary,
+        [primary],
+        max_rounds=4,
+    )
+
+    print("\n--- MODEL READY ---")
+    print("Vector operator: V(lambda) = sign(lambda) * abs(lambda)**(1/5)")
+    print("Enter a prompt using words found in the training corpus.")
+    print("Type /quit to stop.")
+
     while True:
-        prompt=input("\nUSER: ")
-        print("MODEL:",llm.generate(prompt,250,.8))
+        try:
+            prompt = input("\nUSER: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nExiting.")
+            break
+
+        if prompt.lower() in {"/quit", "quit", "exit"}:
+            break
+
+        if not prompt:
+            continue
+
+        print("MODEL:", model.generate(prompt, 250, 0.8))
+
+
+if __name__ == "__main__":
+    main()
