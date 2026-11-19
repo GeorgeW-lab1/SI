@@ -20,7 +20,7 @@ The deconstruct / regenerate loop from the original script is unchanged.
 
 Usage:
   pip install torch datasets numpy
-  python neural_instruct_generator_gpu.py --dataset Open-Orca/OpenOrca --target-gb 2 --save model.pt
+  python neural_instruct_generator_gpu.py --target-gb 2 --save model.pt
   python neural_instruct_generator_gpu.py --load model.pt
   python neural_instruct_generator_gpu.py --dataset my_data.jsonl      # local file
 """
@@ -78,9 +78,15 @@ def row_to_pair(row, columns=None):
         c_inst, c_ctx, c_resp = columns
     else:
         for key in ("conversations", "messages"):
-            if isinstance(row.get(key), list):
-                return (_first_by_role(row[key], HUMAN_ROLES).strip(),
-                        _first_by_role(row[key], BOT_ROLES).strip())
+            turns = row.get(key)
+            if isinstance(turns, str):  # some datasets store the chat as a JSON string
+                try:
+                    turns = json.loads(turns)
+                except ValueError:
+                    turns = None
+            if isinstance(turns, list):
+                return (_first_by_role(turns, HUMAN_ROLES).strip(),
+                        _first_by_role(turns, BOT_ROLES).strip())
         keys = set(row.keys())
         c_inst = _pick(keys, COLUMN_CANDIDATES["instruction"])
         c_ctx = _pick(keys, COLUMN_CANDIDATES["context"])
@@ -105,9 +111,23 @@ def iter_rows(source, config, split, seed):
         random.Random(seed).shuffle(rows)
         yield from rows
     else:
-        from datasets import load_dataset  # lazy: local files need no extra deps
-        ds = load_dataset(source, config, split=split, streaming=True)
-        yield from ds.shuffle(seed=seed, buffer_size=20_000)
+        from datasets import (get_dataset_split_names, interleave_datasets,
+                              load_dataset)  # lazy: local files need no extra deps
+        names = get_dataset_split_names(source, config)
+        if split and split != "all":
+            if split in names:
+                names = [split]
+            else:
+                print(f"Split '{split}' not found; using all splits instead.")
+        elif "train" in names:
+            names = ["train"]
+        print(f"Streaming splits: {names}")
+        parts = [load_dataset(source, config, split=n, streaming=True)
+                 .shuffle(seed=seed, buffer_size=5_000) for n in names]
+        # Interleave so a 2 GB budget samples every split (e.g. every task category)
+        ds = parts[0] if len(parts) == 1 else interleave_datasets(
+            parts, seed=seed, stopping_strategy="all_exhausted")
+        yield from ds
 
 
 def prepare_pairs(source, config, split, target_gb, cache_dir, columns, seed):
@@ -461,11 +481,12 @@ class InstructGenerator:
 # ------------------------------------------------------------------------ CLI
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--dataset", default="Open-Orca/OpenOrca",
-                    help="HF dataset id or local .json/.jsonl file. Other ~2GB+ options: "
-                         "teknium/OpenHermes-2.5, HuggingFaceH4/ultrachat_200k (split train_sft)")
+    ap.add_argument("--dataset", default="microsoft/orca-agentinstruct-1M-v1",
+                    help="HF dataset id or local .json/.jsonl file")
     ap.add_argument("--config", default=None, help="HF dataset config name, if any")
-    ap.add_argument("--split", default="train")
+    ap.add_argument("--split", default=None,
+                    help='split name, or "all"; default: "train" if it exists, '
+                         'otherwise every split interleaved')
     ap.add_argument("--columns", nargs=3, metavar=("INST", "CTX", "RESP"), default=None,
                     help="override column names; use '' for no context column")
     ap.add_argument("--target-gb", type=float, default=2.0, help="raw text to collect")
