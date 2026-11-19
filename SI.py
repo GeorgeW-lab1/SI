@@ -1,1119 +1,327 @@
 #!/usr/bin/env python3
+""" AI: standard-library corpus solver, answer pipeline and feedback RL.
+
+Run: python _ai.py
+This is a retrieval/rule-based assistant, not a general-purpose LLM.
 """
-RUBBER AI - FIXED SKELETON + REINFORCEMENT LEARNING
-===================================================
-
-Uses the settings from:
-    rubber_programs/rubber_0d25c38b2853.rbc
-
-No generated programs. No compiler. No factory framework.
-
-Pipeline:
-    filename -> tokenize -> spatial encode -> trigram learn
-             -> sequential state -> RL train -> prompt -> generate
-"""
-
-import os
-import re
+import hashlib
 import json
 import math
-import shlex
 import random
-import hashlib
-import secrets
-
+import re
 from collections import Counter, defaultdict
 
+SETTINGS = dict(space_bits=14, math_level1_scale=1.1182,
+                math_level2_weight=0.5806, probability_smoothing=0.054,
+                probability_temperature=0.5196, probability_spatial=0.2461,
+                rl_rate=0.08, rl_temperature=0.8, rl_exploration=0.08,
+                rl_episodes=40, rl_length=24)
 
-VERSION = "3.1"
-
-# ============================================================
-# FIXED PROGRAM SKELETON
-# ============================================================
-
-PROGRAM_ID = "0d25c38b2853"
-
-SETTINGS = {
-    "space_bits": 14,
-    "space_dimensions": 3,
-    "trigram_order": 3,
-
-    "math_level1_scale": 1.1182,
-    "math_level2_mode": "AVERAGE",
-    "math_level2_weight": 0.5806,
-
-    "probability_smoothing": 0.054,
-    "probability_temperature": 0.5196,
-    "probability_spatial": 0.2461,
-
-    "rl_rate": 0.08,
-    "rl_temperature": 0.8,
-    "rl_exploration": 0.08,
-    "rl_episodes": 40,
-    "rl_length": 24
+STOP = {
+    'a', 'an', 'and', 'are', 'as', 'at', 'be', 'been', 'being', 'but', 'by',
+    'did', 'do', 'does', 'doing', 'done', 'for', 'from', 'had', 'has', 'have',
+    'having', 'he', 'her', 'hers', 'him', 'his', 'how', 'i', 'if', 'in', 'into',
+    'is', 'it', 'its', 'me', 'my', 'of', 'on', 'or', 'our', 'ours', 'she', 'so',
+    'than', 'that', 'the', 'their', 'theirs', 'them', 'then', 'there', 'these',
+    'they', 'this', 'those', 'to', 'too', 'up', 'very', 'was', 'we', 'were',
+    'what', 'when', 'where', 'which', 'who', 'why', 'will', 'with', 'you',
+    'your', 'yours',
 }
 
 
-# ============================================================
-# UTILITIES
-# ============================================================
-
-def tokenize(text):
-    return re.findall(
-        r"[A-Za-z0-9_]+|[^\w\s]",
-        text.lower()
-    )
+def tokens(text):
+    return re.findall(r"[^\W_]+(?:['\u2019][^\W_]+)*|[^\w\s]", text.lower(), re.UNICODE)
 
 
-def digest(text):
-    return hashlib.sha256(
-        text.encode("utf-8")
-    ).hexdigest()
+def words(text):
+    return [t for t in tokens(text) if any(c.isalnum() for c in t)]
 
 
-def hash_value(text):
-    return int.from_bytes(
-        hashlib.sha256(
-            text.encode("utf-8")
-        ).digest()[:4],
-        "big"
-    )
+def untokenize(ts):
+    s = ' '.join(ts)
+    return re.sub(r'\s+([.,!?;:])', r'\1', s)
 
 
-def clamp(value, low, high):
-    return max(low, min(high, value))
+def hashed(text):
+    return int.from_bytes(hashlib.sha256(text.encode()).digest()[:4], 'big')
 
 
-# ============================================================
-# SPATIAL BINARY ENGINE
-# ============================================================
-
-class RubberSpace:
-
-    def __init__(self, bits=SETTINGS["space_bits"]):
-        self.bits = bits
-        self.limit = 1 << bits
-        self.positions = []
-
-    def encode(self, token, position):
-        h = hash_value(token)
-
-        x = h % self.limit
-        y = ((h >> 8) + position) % self.limit
-        z = ((h >> 16) ^ position) % self.limit
-
-        return {
-            "token": token,
-            "position": position,
-            "xyz": (x, y, z),
-            "binary": (
-                format(x, f"0{self.bits}b"),
-                format(y, f"0{self.bits}b"),
-                format(z, f"0{self.bits}b")
-            )
-        }
-
-    def encode_dataset(self, tokens):
-        self.positions = [
-            self.encode(token, index)
-            for index, token in enumerate(tokens)
-        ]
-
-        return self.positions
-
-    def affinity(self, a, b):
-        distance = math.sqrt(
-            sum(
-                (a[index] - b[index]) ** 2
-                for index in range(3)
-            )
-        )
-
-        maximum = math.sqrt(
-            3 * (self.limit - 1) ** 2
-        )
-
-        return 1.0 - distance / maximum
+def probabilities(logits):
+    peak = max(logits)
+    weights = [math.exp(x - peak) for x in logits]
+    total = sum(weights)
+    return [w / total for w in weights]
 
 
-# ============================================================
-# TWO-LEVEL ARITHMETIC
-# ============================================================
-
-class RubberMath:
-
+class AI:
     def __init__(self):
-        self.mode = SETTINGS["math_level2_mode"]
-        self.scale = SETTINGS["math_level1_scale"]
-        self.weight = SETTINGS["math_level2_weight"]
-
-        self.local_state = 0.0
-        self.global_state = 0.0
-
-    def level_one(
-        self,
-        value,
-        position,
-        affinity,
-        prompt_state
-    ):
-        result = (
-            value * self.scale
-            + position * 0.001
-            + affinity * 0.5
-            + prompt_state * 0.5
-        )
-
-        self.local_state = math.tanh(result)
-        return self.local_state
-
-    def level_two(self, value, previous=None):
-        if previous is None:
-            previous = self.global_state
-
-        if self.mode == "ADD":
-            result = value + previous * self.weight
-
-        elif self.mode == "MULTIPLY":
-            result = value * (
-                1.0 + previous * self.weight
-            )
-
-        elif self.mode == "AVERAGE":
-            result = (value + previous) / 2.0
-
-        elif self.mode == "SUBTRACT":
-            result = value - previous * self.weight
-
-        else:
-            result = value + previous * self.weight
-
-        self.global_state = math.tanh(result)
-        return self.global_state
-
-
-# ============================================================
-# TRIGRAM LANGUAGE ENGINE
-# ============================================================
-
-class RubberTrigrams:
-
-    def __init__(self):
-        self.trigrams = defaultdict(Counter)
-        self.bigrams = defaultdict(Counter)
-        self.unigrams = Counter()
-        self.vocabulary = set()
-        self.smoothing = SETTINGS[
-            "probability_smoothing"
-        ]
-
-    def learn(self, tokens):
-        self.vocabulary.update(tokens)
-        self.unigrams.update(tokens)
-
-        for index in range(len(tokens) - 1):
-            self.bigrams[
-                tokens[index]
-            ][tokens[index + 1]] += 1
-
-        for index in range(len(tokens) - 3):
-            context = tuple(tokens[index:index + 3])
-            target = tokens[index + 3]
-
-            self.trigrams[context][target] += 1
-
-    def observed_transitions(self):
-        transitions = set()
-
-        for context, counter in self.trigrams.items():
-            for target in counter:
-                transitions.add(
-                    context + (target,)
-                )
-
-        return transitions
-
-    def candidates(self, context):
-        context = tuple(context[-3:])
-
-        if context in self.trigrams:
-            return self.trigrams[context], "TRIGRAM"
-
-        if context and context[-1] in self.bigrams:
-            return self.bigrams[context[-1]], "BIGRAM"
-
-        if self.unigrams:
-            return self.unigrams, "UNIGRAM"
-
-        return Counter(), "NONE"
-
-
-# ============================================================
-# REINFORCEMENT-LEARNING POLICY
-# ============================================================
-
-class RubberRLPolicy:
-    """
-    REINFORCE-style policy over next-token choices.
-
-    preference[context][token] is updated using:
-
-        preference += learning_rate * (reward - baseline)
-    """
-
-    def __init__(self):
-        self.preferences = defaultdict(dict)
-
-        self.learning_rate = SETTINGS["rl_rate"]
-        self.temperature = SETTINGS["rl_temperature"]
-        self.exploration = SETTINGS["rl_exploration"]
-        self.l2 = 0.001
-
-        self.episodes = 0
-        self.updates = 0
-        self.total_reward = 0.0
-
-    def choose(self, context, candidates, rng):
-        if not candidates:
-            return None
-
-        context = tuple(context[-3:])
-        preferences = self.preferences[context]
-
-        for token in candidates:
-            preferences.setdefault(token, 0.0)
-
-        if rng.random() < self.exploration:
-            return rng.choice(list(candidates))
-
-        maximum = max(
-            preferences[token]
-            for token in candidates
-        )
-
-        tokens = []
-        weights = []
-
-        for token in candidates:
-            preference = preferences[token]
-
-            weight = math.exp(
-                (preference - maximum)
-                / self.temperature
-            )
-
-            tokens.append(token)
-            weights.append(weight)
-
-        return rng.choices(
-            tokens,
-            weights=weights,
-            k=1
-        )[0]
-
-    def update(self, context, action, reward, baseline):
-        if action is None:
-            return
-
-        context = tuple(context[-3:])
-        preferences = self.preferences[context]
-
-        preferences.setdefault(action, 0.0)
-
-        advantage = reward - baseline
-
-        preferences[action] += (
-            self.learning_rate * advantage
-        )
-
-        for token in preferences:
-            preferences[token] *= (1.0 - self.l2)
-
-        self.updates += 1
-        self.total_reward += reward
-
-    def train_episode(self, episode):
-        self.episodes += 1
-
-        rewards = [
-            step["reward"]
-            for step in episode
-        ]
-
-        if not rewards:
-            return 0.0
-
-        baseline = sum(rewards) / len(rewards)
-
-        for step in episode:
-            self.update(
-                step["context"],
-                step["action"],
-                step["reward"],
-                baseline
-            )
-
-        return baseline
-
-    def export(self):
-        return {
-            "learning_rate": self.learning_rate,
-            "temperature": self.temperature,
-            "exploration": self.exploration,
-            "l2": self.l2,
-            "episodes": self.episodes,
-            "updates": self.updates,
-            "total_reward": self.total_reward,
-            "preferences": {
-                " ".join(context): dict(values)
-                for context, values
-                in self.preferences.items()
-            }
-        }
-
-    def import_policy(self, data):
-        self.learning_rate = data.get(
-            "learning_rate",
-            self.learning_rate
-        )
-
-        self.temperature = data.get(
-            "temperature",
-            self.temperature
-        )
-
-        self.exploration = data.get(
-            "exploration",
-            self.exploration
-        )
-
-        self.l2 = data.get("l2", self.l2)
-        self.episodes = data.get("episodes", 0)
-        self.updates = data.get("updates", 0)
-        self.total_reward = data.get(
-            "total_reward",
-            0.0
-        )
-
-        for context, values in data.get(
-            "preferences",
-            {}
-        ).items():
-            self.preferences[
-                tuple(context.split())
-            ] = dict(values)
-
-
-# ============================================================
-# RUBBER AI ENGINE
-# ============================================================
-
-class RubberAI:
-
-    def __init__(self):
-        self.space = RubberSpace()
-        self.math = RubberMath()
-        self.language = RubberTrigrams()
-        self.policy = RubberRLPolicy()
-
+        self.rng = random.Random()
+        self.text = ''
         self.dataset = []
-        self.spatial_dataset = []
-        self.dataset_hash = ""
-
+        self.sentences = []
+        self.index = defaultdict(set)
+        self.counts = []
+        self.unigrams = Counter()
+        self.bigrams = defaultdict(Counter)
+        self.trigrams = defaultdict(Counter)
+        self.preferences = defaultdict(dict)
+        self.baseline = 0.0
+        self.episodes = 0
+        self.prompt = ''
+        self.translations = {}
+        self.default_chain = ['UNDERSTAND', 'RETRIEVE', 'ANSWER', 'GENERATE']
+        self.chain_values = {}
+        self.evidence_values = {}
+        self.last_feedback = None
+        self.last_trace = []
         self.dataset_state = 0.0
-        self.prompt = ""
-        self.prompt_state = 0.0
 
-        self.ready = False
+    def position(self, token, i):
+        h = hashed(token)
+        limit = 1 << SETTINGS['space_bits']
+        return (h % limit, ((h >> 8) + i) % limit, ((h >> 16) ^ i) % limit)
 
-        self.observed_trigrams = set()
-        self.observed_bigrams = set()
+    def arithmetic(self, token, i, state):
+        x, y, z = self.position(token, i)
+        limit = (1 << SETTINGS['space_bits']) - 1
+        affinity = 1 - (x + y + z) / (3 * limit)
+        local = math.tanh(hashed(token) / 4294967295 * SETTINGS['math_level1_scale']
+                          + i / (i + 1000) + affinity * .5)
+        return math.tanh((local + state) / 2)
 
-    # --------------------------------------------------------
-    # LOAD FILE
-    # --------------------------------------------------------
-
-    def load_dataset(self, filename):
-        print(f"\n[RUBBER] Loading: {filename}")
-
-        with open(
-            filename,
-            "r",
-            encoding="utf-8",
-            errors="replace"
-        ) as file:
-            text = file.read()
-
-        self.dataset = tokenize(text)
-
-        if len(self.dataset) < 6:
-            raise ValueError(
-                "Dataset must contain at least six tokens."
-            )
-
-        self.dataset_hash = digest(text)
-
-        print(
-            "[RUBBER] Tokens:",
-            len(self.dataset)
-        )
-
-        print(
-            "[RUBBER] Dataset hash:",
-            self.dataset_hash[:16]
-        )
-
-        self.space = RubberSpace()
-        self.math = RubberMath()
-        self.language = RubberTrigrams()
-        self.policy = RubberRLPolicy()
-
-        self.spatial_dataset = (
-            self.space.encode_dataset(
-                self.dataset
-            )
-        )
-
-        self.language.learn(self.dataset)
-
-        self.observed_trigrams = (
-            self.language.observed_transitions()
-        )
-
-        self.observed_bigrams = set()
-
-        for source, targets in (
-            self.language.bigrams.items()
-        ):
-            for target in targets:
-                self.observed_bigrams.add(
-                    (source, target)
-                )
-
-        self.execute_dataset_sequence()
-        self.train_policy()
-
-        self.ready = True
-
-        print("[RUBBER] Dataset ready.")
-
-    # --------------------------------------------------------
-    # SEQUENTIAL STATE
-    # --------------------------------------------------------
-
-    def execute_dataset_sequence(self):
-        previous = None
-        state = 0.0
-
-        for item in self.spatial_dataset:
-
-            if previous is None:
-                affinity = 0.5
+    def fit(self, text):
+        ts = tokens(text)
+        if len(ts) < 6:
+            raise ValueError('Provide at least six tokens of source text.')
+        self.text, self.dataset = text, ts
+        self.unigrams = Counter(ts)
+        self.bigrams = defaultdict(Counter)
+        self.trigrams = defaultdict(Counter)
+        self.preferences = defaultdict(dict)
+        self.chain_values, self.evidence_values = {}, {}
+        self.last_feedback = None
+        self.last_trace = []
+        self.baseline, self.episodes = 0.0, 0
+        for i in range(len(ts) - 1):
+            self.bigrams[ts[i]][ts[i + 1]] += 1
+        for i in range(len(ts) - 3):
+            self.trigrams[tuple(ts[i:i + 3])][ts[i + 3]] += 1
+        self.sentences = []
+        for s in re.split(r'(?<=[.!?])\s+|\n+', text):
+            s = s.strip()
+            if not words(s):
+                continue
+            if len(words(s)) > 150:
+                w = s.split()
+                self.sentences.extend(' '.join(w[i:i + 100]) for i in range(0, len(w), 100))
             else:
-                affinity = self.space.affinity(
-                    item["xyz"],
-                    previous
-                )
-
-            value = (
-                hash_value(item["token"])
-                / 4294967295.0
-            )
-
-            local = self.math.level_one(
-                value,
-                item["position"],
-                affinity,
-                0.0
-            )
-
-            state = self.math.level_two(
-                local,
-                state
-            )
-
-            previous = item["xyz"]
-
+                self.sentences.append(s)
+        self.index = defaultdict(set)
+        self.counts = []
+        for i, s in enumerate(self.sentences):
+            c = Counter(words(s))
+            self.counts.append(c)
+            for w in c:
+                self.index[w].add(i)
+        state = 0.0
+        for i, t in enumerate(ts):
+            state = self.arithmetic(t, i, state)
         self.dataset_state = state
 
-    # --------------------------------------------------------
-    # REINFORCEMENT LEARNING
-    # --------------------------------------------------------
-
-    def reward_step(
-        self,
-        context,
-        action,
-        generated,
-        prompt_tokens
-    ):
-        reward = 0.0
-
-        context = tuple(context[-3:])
-        transition = context + (action,)
-
-        if transition in self.observed_trigrams:
-            reward += 1.0
-
-        if (
-            context[-1],
-            action
-        ) in self.observed_bigrams:
-            reward += 0.35
-
-        if action in self.language.vocabulary:
-            reward += 0.10
-
-        if action in prompt_tokens:
-            reward += 0.25
-
-        recent = generated[-8:]
-
-        if action in recent:
-            reward -= 0.35 * (
-                recent.count(action)
-                / max(len(recent), 1)
-            )
-
-        recent_window = generated[-12:]
-
-        unique_recent = len(set(recent_window))
-
-        reward += 0.10 * (
-            unique_recent
-            / max(len(recent_window), 1)
-        )
-
-        return reward
-
-    def run_generation_episode(
-        self,
-        seed_tokens,
-        length,
-        prompt_tokens,
-        rng
-    ):
-        context = list(seed_tokens[-3:])
-
-        if len(context) < 3:
-            context = (
-                self.dataset[:3] + context
-            )[-3:]
-
-        generated = []
-        episode = []
-
-        for _ in range(length):
-            candidates, mode = (
-                self.language.candidates(context)
-            )
-
-            if not candidates:
-                break
-
-            action = self.policy.choose(
-                context,
-                list(candidates),
-                rng
-            )
-
-            if action is None:
-                break
-
-            reward = self.reward_step(
-                context,
-                action,
-                generated,
-                prompt_tokens
-            )
-
-            episode.append(
-                {
-                    "context": tuple(context[-3:]),
-                    "action": action,
-                    "reward": reward
-                }
-            )
-
-            generated.append(action)
-
-            context.append(action)
-            context = context[-3:]
-
-        return generated, episode
-
-    def train_policy(
-        self,
-        episodes=SETTINGS["rl_episodes"],
-        length=SETTINGS["rl_length"]
-    ):
+    def require_data(self):
         if not self.dataset:
-            raise RuntimeError(
-                "Load a dataset first."
-            )
+            raise ValueError('Load source text with DATA first.')
 
-        rng = random.Random(
-            secrets.randbits(64)
-        )
+    def retrieve(self, query, limit=5):
+        terms = set(words(query)) - STOP
+        if not terms:
+            return []
+        scores = defaultdict(float)
+        n = len(self.sentences)
+        for w in terms:
+            ids = self.index.get(w, ())
+            idf = math.log(1 + n / (1 + len(ids)))
+            for i in ids:
+                c = self.counts[i]
+                scores[i] += idf * c[w] / (1 + 0.02 * sum(c.values()))
+        for i in scores:
+            scores[i] *= math.exp(.2 * max(-3, min(3, self.evidence_values.get(self.sentences[i], 0))))
+        return sorted(scores, key=scores.get, reverse=True)[:limit]
 
-        print(
-            f"\n[RUBBER] RL training: "
-            f"{episodes} episodes x {length} tokens"
-        )
+    def candidates(self, context):
+        return (self.trigrams.get(tuple(context[-3:])) or
+                self.bigrams.get(context[-1] if context else '') or self.unigrams)
 
-        total_reward = 0.0
+    def sample(self, context, history, bias, numeric, training):
+        counts = self.candidates(context)
+        items = counts.most_common(256)
+        actions = [t for t, _ in items]
+        key = tuple(context[-3:])
+        pref = self.preferences[key]
+        temp = SETTINGS['rl_temperature'] if training else SETTINGS['probability_temperature']
+        logits = []
+        for t, c in items:
+            spatial = (hashed(t) / 4294967295 - .5) * numeric
+            score = (math.log(c + SETTINGS['probability_smoothing']) + pref.get(t, 0)
+                     + .5 * math.log1p(bias[t]) - .3 * history[-12:].count(t)
+                     + SETTINGS['probability_spatial'] * spatial)
+            logits.append(score / temp)
+        soft = probabilities(logits)
+        eps = SETTINGS['rl_exploration'] if training else 0.0
+        mix = [(1 - eps) * p + eps / len(actions) for p in soft]
+        j = self.rng.choices(range(len(actions)), weights=mix, k=1)[0]
+        factor = (1 - eps) * soft[j] / mix[j] / temp
+        return actions[j], (key, actions, soft, j, factor)
 
+    def update_episode(self, trace):
+        if not trace:
+            return
+        total = 0.0
+        for record, reward in trace:
+            key, actions, soft, j, factor = record
+            advantage = reward - self.baseline
+            prefs = self.preferences[key]
+            for k, t in enumerate(actions):
+                value = prefs.get(t, 0) + SETTINGS['rl_rate'] * advantage * factor * ((k == j) - soft[k])
+                if abs(value) > 1e-12:
+                    prefs[t] = max(-10, min(10, value))
+            total += reward
+        mean = total / len(trace)
+        self.baseline = .9 * self.baseline + .1 * mean
+        self.episodes += 1
+
+    def generate(self, prompt, length=80, training=False, learn=True, seed=None):
+        self.require_data()
+        if not 1 <= length <= 2000:
+            raise ValueError('Length must be between 1 and 2000.')
+        context = list(seed or tokens(prompt)[-3:] or self.dataset[:3])
+        bias = Counter(words(prompt))
+        out, trace = [], []
+        state = self.dataset_state
+        for i in range(length):
+            state = self.arithmetic(context[-1], i, state)
+            t, record = self.sample(context, out, bias, state, training)
+            reward = (.8 if t in self.trigrams.get(tuple(context[-3:]), {}) else 0)
+            reward += .2 * min(1, bias[t]) - .25 * out[-8:].count(t)
+            trace.append((record, reward))
+            out.append(t)
+            context = (context + [t])[-3:]
+        if learn:
+            self.update_episode(trace)
+        return untokenize(out)
+
+    def train(self, episodes=40, length=24):
+        self.require_data()
+        if not 1 <= episodes <= 10000 or not 1 <= length <= 2000:
+            raise ValueError('Episodes: 1..10000; length: 1..2000.')
         for _ in range(episodes):
-            start = rng.randrange(
-                max(1, len(self.dataset) - 3)
-            )
-
-            seed_tokens = self.dataset[
-                start:start + 3
-            ]
-
-            generated, episode = (
-                self.run_generation_episode(
-                    seed_tokens,
-                    length,
-                    [],
-                    rng
-                )
-            )
-
-            average_reward = (
-                self.policy.train_episode(episode)
-            )
-
-            total_reward += average_reward
-
-        print(
-            "[RUBBER] RL training complete. "
-            f"Average reward: "
-            f"{total_reward / max(episodes, 1):.4f}"
-        )
-
-    # --------------------------------------------------------
-    # PROMPT
-    # --------------------------------------------------------
-
-    def set_prompt(self, prompt):
-        self.prompt = prompt
-
-        tokens = tokenize(prompt)
-        value = 0.0
-
-        for index, token in enumerate(tokens):
-            value += (
-                hash_value(token)
-                / 4294967295.0
-            ) / (index + 1)
-
-        self.prompt_state = math.tanh(value)
-
-        print("[RUBBER] Prompt initialized.")
-
-    # --------------------------------------------------------
-    # GENERATION
-    # --------------------------------------------------------
-
-    def generate(
-        self,
-        length=100,
-        learn_online=True
-    ):
-        if not self.ready:
-            raise RuntimeError(
-                "Load a dataset first."
-            )
-
-        prompt_tokens = tokenize(self.prompt)
-
-        context = prompt_tokens[-3:]
-
-        if len(context) < 3:
-            context = (
-                self.dataset[:3] + context
-            )[-3:]
-
-        state = (
-            self.dataset_state + self.prompt_state
-        ) / 2.0
-
-        output = []
-        episode = []
-
-        previous_position = None
-
-        rng = random.Random(
-            secrets.randbits(64)
-        )
-
-        for step in range(length):
-            item = self.spatial_dataset[
-                step % len(self.spatial_dataset)
-            ]
-
-            if previous_position is None:
-                affinity = 0.5
-            else:
-                affinity = self.space.affinity(
-                    item["xyz"],
-                    previous_position
-                )
-
-            previous_position = item["xyz"]
-
-            value = (
-                hash_value(item["token"])
-                / 4294967295.0
-            )
-
-            local = self.math.level_one(
-                value,
-                item["position"],
-                affinity,
-                self.prompt_state
-            )
-
-            state = self.math.level_two(
-                local,
-                state
-            )
-
-            candidates, mode = (
-                self.language.candidates(context)
-            )
-
-            if not candidates:
-                break
-
-            action = self.policy.choose(
-                context,
-                list(candidates),
-                rng
-            )
-
-            if action is None:
-                break
-
-            reward = self.reward_step(
-                context,
-                action,
-                output,
-                prompt_tokens
-            )
-
-            episode.append(
-                {
-                    "context": tuple(context[-3:]),
-                    "action": action,
-                    "reward": reward
-                }
-            )
-
-            output.append(action)
-
-            context.append(action)
-            context = context[-3:]
-
-            generated_value = (
-                hash_value(action)
-                / 4294967295.0
-            )
-
-            local = self.math.level_one(
-                generated_value,
-                step,
-                0.5,
-                self.prompt_state
-            )
-
-            state = self.math.level_two(
-                local,
-                state
-            )
-
-        if learn_online and episode:
-            self.policy.train_episode(episode)
-
-        result = " ".join(output)
-
-        result = re.sub(
-            r"\s+([.,!?;:])",
-            r"\1",
-            result
-        )
-
-        return result
-
-    # --------------------------------------------------------
-    # STATUS
-    # --------------------------------------------------------
-
-    def status(self):
-        return {
-            "version": VERSION,
-            "program_id": PROGRAM_ID,
-            "ready": self.ready,
-            "dataset_tokens": len(self.dataset),
-            "vocabulary": len(
-                self.language.vocabulary
-            ),
-            "trigrams": len(
-                self.language.trigrams
-            ),
-            "dataset_state": self.dataset_state,
-            "prompt_state": self.prompt_state,
-            "rl_episodes": self.policy.episodes,
-            "rl_updates": self.policy.updates,
-            "rl_total_reward": (
-                self.policy.total_reward
-            ),
-            "settings": SETTINGS
-        }
-
-    # --------------------------------------------------------
-    # SAVE / LOAD
-    # --------------------------------------------------------
-
-    def save(self, filename):
-        if not self.ready:
-            raise RuntimeError(
-                "No trained dataset."
-            )
-
-        data = {
-            "version": VERSION,
-            "program_id": PROGRAM_ID,
-            "settings": SETTINGS,
-            "dataset": self.dataset,
-            "dataset_hash": self.dataset_hash,
-            "unigrams": dict(
-                self.language.unigrams
-            ),
-            "bigrams": [
-                {
-                    "context": context,
-                    "counts": dict(counts)
-                }
-                for context, counts
-                in self.language.bigrams.items()
-            ],
-            "trigrams": [
-                {
-                    "context": list(context),
-                    "counts": dict(counts)
-                }
-                for context, counts
-                in self.language.trigrams.items()
-            ],
-            "rl_policy": self.policy.export()
-        }
-
-        with open(
-            filename,
-            "w",
-            encoding="utf-8"
-        ) as file:
-            json.dump(
-                data,
-                file,
-                ensure_ascii=False
-            )
-
-        print("[RUBBER] Model saved.")
-
-    def load_model(self, filename):
-        with open(
-            filename,
-            "r",
-            encoding="utf-8"
-        ) as file:
-            data = json.load(file)
-
-        self.dataset = data["dataset"]
-        self.dataset_hash = data.get(
-            "dataset_hash",
-            ""
-        )
-
-        self.space = RubberSpace(
-            SETTINGS["space_bits"]
-        )
-
-        self.spatial_dataset = (
-            self.space.encode_dataset(
-                self.dataset
-            )
-        )
-
-        self.language = RubberTrigrams()
-
-        self.language.unigrams = Counter(
-            data["unigrams"]
-        )
-
-        self.language.vocabulary = set(
-            self.language.unigrams
-        )
-
-        for item in data["bigrams"]:
-            self.language.bigrams[
-                item["context"]
-            ] = Counter(item["counts"])
-
-        for item in data["trigrams"]:
-            self.language.trigrams[
-                tuple(item["context"])
-            ] = Counter(item["counts"])
-
-        self.observed_trigrams = (
-            self.language.observed_transitions()
-        )
-
-        self.observed_bigrams = set()
-
-        for source, targets in (
-            self.language.bigrams.items()
-        ):
-            for target in targets:
-                self.observed_bigrams.add(
-                    (source, target)
-                )
-
-        self.policy = RubberRLPolicy()
-        self.policy.import_policy(
-            data.get("rl_policy", {})
-        )
-
-        self.execute_dataset_sequence()
-
-        self.ready = True
-
-        print(
-            "[RUBBER] Model and RL policy restored."
-        )
-
-
-# ============================================================
-# TERMINAL UI
-# ============================================================
-
-def print_help():
-    print("""
-========================================
-     RUBBER AI 3.1
-========================================
-
-DATA filename.txt      Load dataset and train RL
-PROMPT text            Set generation prompt
-GENERATE 100           Generate 100 tokens
-TRAIN 100 24           Run 100 RL episodes of 24 tokens
-STATUS                 Show engine and RL status
-SETTINGS               Show fixed skeleton settings
-SAVE model.json        Save model and RL policy
-LOAD model.json        Restore model and RL policy
-HELP                   Show commands
-EXIT                   Quit
-========================================
-""")
+            i = self.rng.randrange(max(1, len(self.dataset) - 2))
+            self.generate('', length, True, True, self.dataset[i:i + 3])
+        return f'Trained {episodes} additional episodes; baseline reward {self.baseline:.3f}.'
+
+    def save(self, path):
+        self.require_data()
+        data = dict(version='4.0', text=self.text, settings=SETTINGS, prompt=self.prompt,
+                    translations=self.translations, chain_values=self.chain_values,
+                    evidence_values=self.evidence_values, default_chain=self.default_chain,
+                    baseline=self.baseline, episodes=self.episodes,
+                    policy=[dict(context=list(k), values=v) for k, v in self.preferences.items()])
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False)
+
+    def load(self, path):
+        with open(path, encoding='utf-8') as f:
+            data = json.load(f)
+        if data.get('version') != '4.0':
+            raise ValueError('Use a version 4.0 save, or reload the original text with DATA.')
+        self.fit(data['text'])
+        self.prompt = data.get('prompt', '')
+        self.translations = data.get('translations', {})
+        self.chain_values = data.get('chain_values', {})
+        self.evidence_values = data.get('evidence_values', {})
+        self.default_chain = data.get('default_chain', self.default_chain)
+        self.baseline = data.get('baseline', 0.0)
+        self.episodes = data.get('episodes', 0)
+        for row in data.get('policy', []):
+            self.preferences[tuple(row['context'])] = row['values']
+
+
+HELP = '''
+SI 4.0
+DATA filename.txt        Load plain text and run 40 RL episodes
+LOAD model.json          Restore a version 4.0 save
+SAVE model.json          Save source, policy, translations and feedback
+PROMPT text              Set free-generation prompt
+GENERATE 80              Sample n-gram text (not a factual answer)
+TRAIN 40 24              Additional RL episodes and tokens per episode
+STATUS / SETTINGS / HELP / EXIT
+
+Paths may contain spaces or Windows backslashes; outer quotes are optional.
+Ordinary input without a command is treated as SOLVE.
+'''
+
+
+def filename(s):
+    return s.strip().strip('"').strip("'")
 
 
 def interactive():
-    ai = RubberAI()
-
-    print_help()
-
+    ai = AI()
+    print(HELP)
+    print('Limitations: retrieval and rules, not general language understanding.')
+    try:
+        initial = input('Dataset filename (Enter to skip): ').strip()
+        if initial:
+            with open(filename(initial), encoding='utf-8', errors='replace') as f:
+                ai.fit(f.read())
+            print(ai.train())
+    except (OSError, ValueError) as e:
+        print('[ERROR]', e)
+    except (EOFError, KeyboardInterrupt):
+        return
     while True:
         try:
-            line = input("\nRUBBER> ").strip()
-
+            line = input('\nSI> ').strip()
             if not line:
                 continue
-
-            parts = shlex.split(line)
-            command = parts[0].upper()
-            args = parts[1:]
-
-            if command == "EXIT":
+            first, _, arg = line.partition(' ')
+            command = first.upper()
+            arg = arg.strip()
+            if command in ('EXIT', 'QUIT', '/QUIT'):
                 break
-
-            elif command == "HELP":
-                print_help()
-
-            elif command == "DATA":
-                if not args:
-                    print("Usage: DATA filename.txt")
-                    continue
-
-                ai.load_dataset(args[0])
-
-            elif command == "PROMPT":
-                if not args:
-                    print("Usage: PROMPT your prompt text")
-                    continue
-
-                ai.set_prompt(" ".join(args))
-
-            elif command == "GENERATE":
-                length = (
-                    int(args[0]) if args else 100
-                )
-
-                print(
-                    "\n" + ai.generate(length) + "\n"
-                )
-
-            elif command == "TRAIN":
-                episodes = (
-                    int(args[0]) if args else 100
-                )
-
-                length = (
-                    int(args[1])
-                    if len(args) > 1
-                    else SETTINGS["rl_length"]
-                )
-
-                ai.train_policy(episodes, length)
-
-            elif command == "STATUS":
-                print(
-                    json.dumps(
-                        ai.status(),
-                        indent=2
-                    )
-                )
-
-            elif command == "SETTINGS":
-                print(
-                    json.dumps(
-                        SETTINGS,
-                        indent=2
-                    )
-                )
-
-            elif command == "SAVE":
-                if not args:
-                    print("Usage: SAVE model.json")
-                    continue
-
-                ai.save(args[0])
-
-            elif command == "LOAD":
-                if not args:
-                    print("Usage: LOAD model.json")
-                    continue
-
-                ai.load_model(args[0])
-
-            else:
-                print("Unknown command.")
-
-        except Exception as error:
-            print("[ERROR]", error)
+            elif command == 'HELP':
+                print(HELP)
+            elif command == 'DATA':
+                with open(filename(arg), encoding='utf-8', errors='replace') as f:
+                    ai.fit(f.read())
+                print(ai.train())
+            elif command == 'SAVE':
+                ai.save(filename(arg))
+                print('Saved.')
+            elif command == 'LOAD':
+                ai.load(filename(arg))
+                print('Restored.')
+            elif command == 'PROMPT':
+                ai.prompt = arg
+                print('Prompt set.')
+            elif command == 'GENERATE':
+                print(ai.generate(ai.prompt, int(arg or 80)))
+            elif command == 'TRAIN':
+                values = arg.split()
+                print(ai.train(int(values[0]) if values else 40, int(values[1]) if len(values) > 1 else 24))
+            elif command == 'STATUS':
+                print(json.dumps(dict(tokens=len(ai.dataset), vocabulary=len(ai.unigrams),
+                      sentences=len(ai.sentences), contexts=len(ai.trigrams), episodes=ai.episodes,
+                      baseline=ai.baseline, default_chain=ai.default_chain,
+                      rated_chains=ai.chain_values), indent=2))
+            elif command == 'SETTINGS':
+                print(json.dumps(SETTINGS, indent=2))
+        except (EOFError, KeyboardInterrupt):
+            print('\nGoodbye.')
+            break
+        except (OSError, ValueError, KeyError, TypeError) as e:
+            print('[ERROR]', e)
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     interactive()
