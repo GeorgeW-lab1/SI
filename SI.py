@@ -380,7 +380,7 @@ if __name__ == "__main__":
     unk_id = stoi["<unk>"]
 
     data = torch.tensor([stoi.get(w, unk_id) for w in words], dtype=torch.long)
-    ngram_size = 5
+    ngram_size = 17
     seq_len = min(24, max(1, len(data) - 1))
     batch_size = 8
 
@@ -408,8 +408,8 @@ if __name__ == "__main__":
 
         if (step_idx + 1) % 30 == 0:
             print(f"Step {step_idx + 1:3d} | Loss: {loss.item():.4f}")
-
-    prompt_words = tokenize_words("what are the truths about God")
-    prompt_ids = [stoi.get(w, unk_id) for w in prompt_words]
-    generated_ids = model.generate(prompt_ids, max_new_tokens=80)
-    print("Generated:", detokenize_words([itos[i] for i in list(reversed(generated_ids))]))
+    while True:
+        prompt_words = tokenize_words(input("USER: "))
+        prompt_ids = [stoi.get(w, unk_id) for w in prompt_words]
+        generated_ids = model.generate(prompt_ids, max_new_tokens=80)
+        print("Generated:", detokenize_words([itos[i] for i in list(reversed(generated_ids))]))
