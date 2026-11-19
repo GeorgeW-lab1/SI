@@ -19,7 +19,7 @@ Pipeline for large data
 The deconstruct / regenerate loop from the original script is unchanged.
 
 Usage:
-  pip install torch datasets numpy
+  pip install torch datasets numpy tqdm
   python neural_instruct_generator_gpu.py --target-gb 2 --save model.pt
   python neural_instruct_generator_gpu.py --load model.pt
   python neural_instruct_generator_gpu.py --dataset my_data.jsonl      # local file
@@ -38,6 +38,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from tqdm.auto import tqdm
 
 # Special tokens occupy the first ids.
 SPECIALS = ["<unk>", "<pad>", "<|resp|>", "<|end|>"]
@@ -118,10 +119,10 @@ def iter_rows(source, config, split, seed):
             if split in names:
                 names = [split]
             else:
-                print(f"Split '{split}' not found; using all splits instead.")
+                tqdm.write(f"Split '{split}' not found; using all splits instead.")
         elif "train" in names:
             names = ["train"]
-        print(f"Downloading streaming splits: {names}")
+        tqdm.write(f"Streaming splits: {names}")
         parts = [load_dataset(source, config, split=n, streaming=True)
                  .shuffle(seed=seed, buffer_size=5_000) for n in names]
         # Interleave so a 2 GB budget samples every split (e.g. every task category)
@@ -141,17 +142,19 @@ def prepare_pairs(source, config, split, target_gb, cache_dir, columns, seed):
 
     budget = int(target_gb * 1e9)
     seen = kept = 0
-    t0 = time.time()
-    with open(path + ".tmp", "w", encoding="utf-8") as out:
-        for n, row in enumerate(iter_rows(source, config, split, seed), 1):
+    with open(path + ".tmp", "w", encoding="utf-8") as out, \
+            tqdm(total=budget, unit="B", unit_scale=True, unit_divisor=1000,
+                 desc="Downloading/caching", smoothing=0.1) as bar:
+        for row in iter_rows(source, config, split, seed):
             inst, resp = row_to_pair(row, columns)
             if inst and resp:
                 out.write(json.dumps([inst, resp], ensure_ascii=False) + "\n")
-                seen += len(inst.encode("utf-8")) + len(resp.encode("utf-8"))
+                nbytes = len(inst.encode("utf-8")) + len(resp.encode("utf-8"))
+                seen += nbytes
                 kept += 1
-            if n % 100_000 == 0:
-                print(f"  streamed {n:,} rows, {seen / 1e9:.2f}/{target_gb:g} GB "
-                      f"({time.time() - t0:.0f}s)")
+                bar.update(min(nbytes, max(budget - bar.n, 0)))
+                if kept % 2000 == 0:
+                    bar.set_postfix(rows=f"{kept:,}")
             if seen >= budget:
                 break
     os.replace(path + ".tmp", path)
@@ -301,10 +304,9 @@ class InstructGenerator:
         jobs = [(path, s, e, self.max_inst, self.max_resp) for s, e in _ranges(sample_end, workers * 8)]
         counts = Counter()
         with Pool(workers) as pool:
-            for i, c in enumerate(pool.imap_unordered(_count_chunk, jobs), 1):
+            for c in tqdm(pool.imap_unordered(_count_chunk, jobs), total=len(jobs),
+                          desc="Counting words"):
                 counts.update(c)
-                print(f"\r  counting words {i}/{len(jobs)}", end="", flush=True)
-        print()
         common = [w for w, _ in counts.most_common(self.max_vocab - len(SPECIALS))]
         self.vocab = SPECIALS + common
         self.stoi = {w: i for i, w in enumerate(self.vocab)}
@@ -317,10 +319,9 @@ class InstructGenerator:
         parts = []
         with Pool(workers, initializer=_init_worker,
                   initargs=(self.stoi, self.max_inst, self.max_resp, dtype_name)) as pool:
-            for i, r in enumerate(pool.imap_unordered(_encode_chunk, jobs), 1):
+            for r in tqdm(pool.imap_unordered(_encode_chunk, jobs), total=len(jobs),
+                          desc="Encoding"):
                 parts.append(r)
-                print(f"\r  encoding {i}/{len(jobs)}", end="", flush=True)
-        print()
         inst = np.concatenate([p[0] for p in parts])
         flat = np.concatenate([p[1] for p in parts])
         lens = np.concatenate([p[2] for p in parts])
@@ -339,7 +340,7 @@ class InstructGenerator:
 
     # -- training
     def train(self, corpus, epochs=1.0, batch=8192, lr=2e-3, warmup=200,
-              log_every=500, compile_model=False):
+              log_every=100, compile_model=False):
         torch.manual_seed(self.seed)
         dev = self.device
         if dev.type == "cuda":
@@ -359,8 +360,8 @@ class InstructGenerator:
 
         self.net.train()
         running = torch.zeros((), device=dev)
-        t0 = time.time()
-        for step in range(1, steps + 1):
+        bar = tqdm(range(1, steps + 1), desc="Training", unit="step", smoothing=0.05)
+        for step in bar:
             q = torch.randint(0, corpus.T, (batch,), device=corpus.dev)  # sampling with replacement
             ctx, inst, y = (t.to(dev, non_blocking=True) for t in corpus.batch(q))
             with torch.autocast(dev.type, dtype=torch.bfloat16, enabled=use_amp):
@@ -371,11 +372,10 @@ class InstructGenerator:
             opt.step()
             sched.step()
             running += loss.detach()
-            if step % log_every == 0 or step == steps:
+            if step % log_every == 0 or step == steps:  # only sync with the GPU occasionally
                 n = log_every if step % log_every == 0 else step % log_every
-                el = time.time() - t0
-                print(f"  step {step}/{steps}  loss {running.item() / n:.4f}  "
-                      f"{step / el:.1f} it/s  eta {(steps - step) / (step / el) / 60:.1f} min")
+                bar.set_postfix(loss=f"{running.item() / n:.4f}",
+                                lr=f"{sched.get_last_lr()[0]:.2e}")
                 running.zero_()
         self.net.eval()
 
