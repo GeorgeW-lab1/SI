@@ -1,77 +1,39 @@
-import numpy as np
 from collections import deque
-
-KB_LIMIT = 99999
-PRIMARY_FRAC = 1.75
-LL_FLOOR = 1e-2
-
-
-def V(lam):
-    """Element-wise real fifth-root vector operator."""
-    lam = np.asarray(lam, dtype=float)
-    return np.sign(lam) * np.abs(lam) ** 0.2
+import math
+import re
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 
-# ============================================================
-# 1. OPTOELECTRONIC RESERVOIR
-# ============================================================
+class V(np.ndarray):
+    """Lightweight ndarray subclass for V(...)."""
+    def __new__(cls, input_array):
+        return np.asarray(input_array, dtype=float).view(cls)
 
-class WordOptoelectronicLLM:
-    def __init__(self, corpus, extra_corpora=None, dt=0.001, seed=42):
+
+class ReservoirCell:
+    def __init__(self, high=3.5, low=1.5, dt=0.1, tau=1.0, vth=0.7, delay_len=4, seed=42):
+        self.high = high
+        self.low = low
+        self.dt = dt
+        self.tau = tau
+        self.vth = vth
         self.rng = np.random.default_rng(seed)
-        self.dt = float(dt)
-
-        self.raw = [corpus[:KB_LIMIT]]
-        self.raw += [x[:KB_LIMIT] for x in (extra_corpora or [])]
-
-        self.primary = self.tokenize(self.raw[0])
-        self.extras = [self.tokenize(x) for x in self.raw[1:]]
-        self.extras = [tokens for tokens in self.extras if tokens]
-
-        datasets = [self.primary] + self.extras
-        self.vocab = sorted(set(token for data in datasets for token in data))
-        if not self.vocab:
-            raise ValueError(
-                "The corpus must contain at least three whitespace-separated words."
-            )
-
-        self.vocab_size = len(self.vocab)
-        self.tok_to_id = {word: i for i, word in enumerate(self.vocab)}
-        self.id_to_tok = dict(enumerate(self.vocab))
-
-        self.roi = self.rng.uniform(0.2, 4.8, (self.vocab_size, 2))
-
-        self.vcc = 5.0
-        self.high = 3.0
-        self.low = 1.5
-        self.tau = 0.0047
-        self.vth = 0.7
-        self.alpha = 0.25
-
-        self.state_dim = 8
-        self.split = 6
-        self.W_main = np.zeros((6, self.vocab_size))
-        self.W_aux = np.zeros((2, self.vocab_size))
+        self.delay_len = delay_len
         self.reset()
 
-    @staticmethod
-    def tokenize(text):
-        words = text.split()
-        return [" ".join(words[i:i + 3]) for i in range(len(words) - 2)]
-
     def reset(self):
+        self.steps = 0
         self.driver = 0.0
         self.vrc = 0.0
         self.top = 0.0
         self.bot = 0.0
-        self.probe = 0.0
-
-        delay_length = max(1, int(0.010 / self.dt))
-        self.delay = deque([0] * delay_length, maxlen=delay_length)
-
-        self.dff = 0
+        self.delay = deque([0] * self.delay_len, maxlen=self.delay_len)
         self.clock = 0
-        self.steps = 0
+        self.dff = 0
+        self.probe = 0.0
 
     def step(self, a, b, ext=0):
         self.steps += 1
@@ -126,258 +88,328 @@ class WordOptoelectronicLLM:
         ], dtype=float)
 
         # Apply the fifth-root vector operator to every reservoir state.
-        return V(state)
+        return V(sorted(np.log(np.exp(state))))
 
-    def encode(self, tokens, ticks=20):
-        output = []
 
-        for token in tokens:
-            token_id = self.tok_to_id.get(token, 0)
-            a, b = self.roi[token_id]
+class SyntacticGeometryLayer(nn.Module):
+    """
+    Applies a syntactic geometry layer over an n-gram window (batch, seq_len, n, dim):
+      1. Encodes syntactic role/offset phase across window positions (relative to head w_t).
+      2. Computes geometric transition features (stepwise deltas, head-relative deltas,
+         and cosine similarities) capturing syntactic relations in embedding space.
+      3. Replicates/expands geometric structure across k syntactic channels to control
+         the current layer's representation via gated modulation.
+    """
+    def __init__(self, n: int, hidden_dim: int, num_geom_replicas: int = 4):
+        super().__init__()
+        self.n = n
+        self.hidden_dim = hidden_dim
+        self.num_geom_replicas = num_geom_replicas
 
-            state = np.zeros(self.state_dim)
-            for tick in range(ticks):
-                state = self.step(
-                    a + self.rng.normal(0.0, 0.05),
-                    b + self.rng.normal(0.0, 0.05),
-                    int(tick == ticks // 2),
-                )
-            output.append(state)
+        # Syntactic offset embeddings for positions 0..n-1 (index n-1 is current head word t)
+        self.syntax_pos_emb = nn.Parameter(torch.randn(1, 1, n, hidden_dim) * 0.02)
 
-        return np.asarray(output, dtype=float).reshape(-1, self.state_dim)
+        # Geometric feature dim per token in window:
+        #   base (hidden_dim) + stepwise_delta (hidden_dim) + head_delta (hidden_dim) + cos_to_head (1)
+        geom_in_dim = hidden_dim * 3 + 1
 
-    def ridge(self, datasets, state_slice, alpha):
-        dimension = state_slice.stop - state_slice.start
-        gram = np.zeros((dimension, dimension))
-        cross = np.zeros((dimension, self.vocab_size))
+        # Replicate geometric manifold across K syntactic channels
+        self.replicate_proj = nn.Linear(n * geom_in_dim, hidden_dim * num_geom_replicas)
+        self.norm = nn.LayerNorm(hidden_dim)
 
-        for tokens in datasets:
-            if len(tokens) < 2:
-                continue
-
-            self.reset()
-            X = self.encode(tokens[:-1])[:, state_slice]
-
-            Y = np.zeros((len(tokens) - 1, self.vocab_size))
-            for i, token in enumerate(tokens[1:]):
-                Y[i, self.tok_to_id[token]] = 1.0
-
-            gram += X.T @ X
-            cross += X.T @ Y
-
-        self.reset()
-        return np.linalg.solve(
-            gram + alpha * np.eye(dimension),
-            cross
+        # Syntactic controller: produces a gate & shift to steer the current layer
+        self.syntax_controller = nn.Sequential(
+            nn.Linear(hidden_dim * (num_geom_replicas + 1), hidden_dim * 2),
+            nn.GELU(),
+            nn.Linear(hidden_dim * 2, hidden_dim * 2),  # [gate_logits, delta_shift]
         )
 
-    def train(self, alpha=0.01):
-        self.W_main = self.ridge(
-            [self.primary], slice(0, 6), alpha
+    def _apply_rotary_syntax_phase(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Applies deterministic syntactic phase rotation along token offsets relative to head (n-1).
+        x: (batch, seq_len, n, dim)
+        """
+        _, _, n, dim = x.shape
+        half_dim = dim // 2
+        if half_dim == 0:
+            return x
+
+        # Relative syntactic distance from head word: -(n-1), ..., -1, 0
+        offsets = torch.arange(n, device=x.device, dtype=x.dtype) - float(n - 1)
+        freqs = torch.exp(
+            -math.log(10000.0) * torch.arange(half_dim, device=x.device, dtype=x.dtype) / max(half_dim, 1)
         )
-        self.W_aux = self.ridge(
-            self.extras or [self.primary], slice(6, 8), alpha
+        angles = offsets[:, None] * freqs[None, :]  # (n, half_dim)
+        cos_a = torch.cos(angles)[None, None, :, :]
+        sin_a = torch.sin(angles)[None, None, :, :]
+
+        x_even = x[..., : 2 * half_dim : 2]
+        x_odd = x[..., 1 : 2 * half_dim : 2]
+        rot_even = x_even * cos_a - x_odd * sin_a
+        rot_odd = x_even * sin_a + x_odd * cos_a
+
+        rotated = x.clone()
+        rotated[..., : 2 * half_dim : 2] = rot_even
+        rotated[..., 1 : 2 * half_dim : 2] = rot_odd
+        return rotated
+
+    def forward(self, win_emb: torch.Tensor, current_layer_repr: torch.Tensor):
+        """
+        win_emb: (batch, seq_len, n, hidden_dim)
+        current_layer_repr: (batch, seq_len, hidden_dim)
+        Returns:
+          controlled_repr: (batch, seq_len, hidden_dim)
+          geom_summary: (batch, seq_len, hidden_dim)
+        """
+        batch_size, seq_len, n, dim = win_emb.shape
+
+        # 1. Inject syntactic position & rotary phase geometry
+        geom_tokens = self._apply_rotary_syntax_phase(win_emb + self.syntax_pos_emb)
+
+        # Head word (current token t) is at index n - 1
+        head_tok = geom_tokens[:, :, -1:, :].expand(-1, -1, n, -1)
+
+        # Stepwise syntactic transition: v_k - v_{k-1} (with zero delta at k=0)
+        prev_tokens = torch.cat(
+            [geom_tokens[:, :, :1, :], geom_tokens[:, :, :-1, :]], dim=2
         )
-        return self
+        step_delta = geom_tokens - prev_tokens
 
-    def probs(self, state, temp=0.4):
-        state = np.atleast_2d(state)
+        # Geometric offset to syntactic head: v_k - v_head
+        head_delta = geom_tokens - head_tok
 
-        logits = (
-            state[:, :6] @ self.W_main
-            + state[:, 6:] @ self.W_aux
+        # Cosine similarity with head word as scalar geometric alignment
+        cos_sim = F.cosine_similarity(geom_tokens, head_tok, dim=-1).unsqueeze(-1)
+
+        geom_features = torch.cat([geom_tokens, step_delta, head_delta, cos_sim], dim=-1)
+        flat_geom = geom_features.reshape(batch_size, seq_len, -1)
+
+        # 2. Replicate across K syntactic geometric channels
+        replicated = self.replicate_proj(flat_geom)  # (batch, seq_len, K * dim)
+        geom_summary = self.norm(
+            replicated.view(batch_size, seq_len, self.num_geom_replicas, dim).mean(dim=2)
         )
 
-        scale = np.maximum(
-            0.1,
-            temp * (0.8 + 0.4 * state[:, 7, None])
+        # 3. Syntactically control the current layer
+        ctrl_in = torch.cat([replicated, current_layer_repr], dim=-1)
+        gate_logits, shift = self.syntax_controller(ctrl_in).chunk(2, dim=-1)
+        syntax_gate = torch.sigmoid(gate_logits)
+
+        controlled_repr = self.norm(
+            current_layer_repr * (0.5 + syntax_gate) + shift * syntax_gate
         )
-        logits = (logits - logits.max(axis=1, keepdims=True)) / scale
-
-        exp_logits = np.exp(logits)
-        return exp_logits / exp_logits.sum(axis=1, keepdims=True)
-
-    def generate(self, prompt, num_words=250, temperature=0.8):
-        tokens = self.tokenize(prompt)
-        if not tokens:
-            return prompt
-
-        self.reset()
-        state = self.encode(tokens)[-1]
-
-        for _ in range(num_words):
-            probabilities = self.probs(state, temperature)[0]
-            next_token = self.id_to_tok[
-                self.rng.choice(self.vocab_size, p=probabilities)
-            ]
-            tokens.append(next_token)
-            state = self.encode([next_token])[-1]
-
-        return " ".join(tokens)
+        return controlled_repr, geom_summary
 
 
-# ============================================================
-# 2. NATURALNESS ASSESSMENT AGAINST ORIGINAL DATA
-# ============================================================
+class NGramReservoirLLM(nn.Module):
+    """
+    Word n-gram reservoir language model with a SyntacticGeometryLayer that replicates
+    geometric syntactic relations to control the current layer before driving the reservoir.
+    """
+    def __init__(
+        self,
+        vocab_size: int,
+        pad_id: int,
+        n: int = 3,
+        num_cells: int = 32,
+        hidden_dim: int = 128,
+        num_geom_replicas: int = 4,
+        seed: int = 42,
+    ):
+        super().__init__()
+        if n < 1:
+            raise ValueError("n must be >= 1")
+        self.vocab_size = vocab_size
+        self.pad_id = pad_id
+        self.n = n
+        self.num_cells = num_cells
+        self.hidden_dim = hidden_dim
+        self.cells = [ReservoirCell(seed=seed + i) for i in range(num_cells)]
 
-class NaturalnessAssessor:
-    weights = (0.65, 0.25, 0.20, 0.20)
+        # Embedding for each of the n words in the n-gram: (t-n+1, ..., t)
+        self.token_emb = nn.Embedding(vocab_size, hidden_dim)
+        self.ngram_proj = nn.Sequential(
+            nn.Linear(hidden_dim * n, hidden_dim),
+            nn.GELU(),
+        )
 
-    def __init__(self, text):
-        words = text[:KB_LIMIT].split()
-        if len(words) < 6:
-            raise ValueError(
-                "Naturalness assessment needs at least six words of source text."
+        # Syntactic geometry layer controlling the current layer
+        self.syntax_geom = SyntacticGeometryLayer(
+            n=n,
+            hidden_dim=hidden_dim,
+            num_geom_replicas=num_geom_replicas,
+        )
+
+        # Syntactically controlled n-gram context -> controls (a, b, ext) per cell
+        self.to_controls = nn.Linear(hidden_dim, num_cells * 3)
+
+        # Reservoir state + controlled n-gram + syntactic geometry summary -> next-word logits
+        self.readout = nn.Sequential(
+            nn.Linear(num_cells * 8 + hidden_dim * 2, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, vocab_size),
+        )
+
+    def build_ngram_windows(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """
+        input_ids: (batch, seq_len)
+        returns windows: (batch, seq_len, n) where index -1 is current word t
+        and index 0 is t - n + 1.
+        """
+        batch_size, seq_len = input_ids.shape
+        if self.n > 1:
+            pad = torch.full(
+                (batch_size, self.n - 1),
+                self.pad_id,
+                dtype=input_ids.dtype,
+                device=input_ids.device,
             )
+            padded = torch.cat([pad, input_ids], dim=1)
+        else:
+            padded = input_ids
 
-        cut = max(3, int(len(words) * 0.9))
-        cut = min(cut, len(words) - 3)
+        slices = [padded[:, k : k + seq_len] for k in range(self.n)]
+        return torch.stack(slices, dim=-1)
 
-        self.train = " ".join(words[:cut])
-        self.hold = WordOptoelectronicLLM.tokenize(" ".join(words[cut:]))
+    def encode_ngrams(self, input_ids: torch.Tensor):
+        """
+        returns:
+          controlled_repr: (batch, seq_len, hidden_dim)
+          geom_summary: (batch, seq_len, hidden_dim)
+        """
+        windows = self.build_ngram_windows(input_ids)  # (batch, seq_len, n)
+        win_emb = self.token_emb(windows)  # (batch, seq_len, n, hidden_dim)
+        flat_ngram = win_emb.flatten(start_dim=2)  # (batch, seq_len, n * hidden_dim)
+        base_repr = self.ngram_proj(flat_ngram)  # (batch, seq_len, hidden_dim)
 
-        all_tokens = WordOptoelectronicLLM.tokenize(" ".join(words))
-        self.seen = set(zip(all_tokens[:-1], all_tokens[1:]))
+        controlled_repr, geom_summary = self.syntax_geom(win_emb, base_repr)
+        return controlled_repr, geom_summary
 
-        training_tokens = WordOptoelectronicLLM.tokenize(self.train)
-        self.start = training_tokens[-1] if training_tokens else None
-
-    def assess(self, model, n=80, temp=0.4, seed=1234):
-        if not model.vocab:
-            return {
-                "likelihood": 0.0,
-                "seen": 0.0,
-                "coherence": 0.0,
-                "diversity": 0.0,
-                "composite": 0.0,
-            }
-
-        model.rng = np.random.default_rng(seed)
-        model.reset()
-
-        X = (
-            model.encode(self.hold[:-1])
-            if len(self.hold) > 1
-            else np.empty((0, 8))
-        )
-
-        log_likelihoods = []
-        for i, state in enumerate(X):
-            probabilities = model.probs(state, temp)[0]
-            target = model.tok_to_id.get(self.hold[i + 1])
-            target_probability = (
-                probabilities[target] if target is not None else 0.0
+    def rollout_reservoir(self, ngram_repr: torch.Tensor) -> torch.Tensor:
+        """
+        ngram_repr: (batch, seq_len, hidden_dim)
+        returns reservoir_feats: (batch, seq_len, num_cells * 8)
+        """
+        batch_size, seq_len, _ = ngram_repr.shape
+        with torch.no_grad():
+            raw_ctrl = self.to_controls(ngram_repr).view(
+                batch_size, seq_len, self.num_cells, 3
             )
-            log_likelihoods.append(
-                np.log(max(target_probability, LL_FLOOR))
-            )
+            a_ctrl = torch.sigmoid(raw_ctrl[..., 0]) * 5.0
+            b_ctrl = torch.sigmoid(raw_ctrl[..., 1]) * 5.0
+            ext_ctrl = (raw_ctrl[..., 2] > 0.0).to(torch.int64)
 
-        likelihood = (
-            np.clip(
-                1.0 + np.mean(log_likelihoods) / np.log(1.0 / LL_FLOOR),
-                0.0,
-                1.0,
-            )
-            if log_likelihoods else 0.0
-        )
+            out = np.zeros((batch_size, seq_len, self.num_cells, 8), dtype=np.float32)
 
-        model.rng = np.random.default_rng(seed + 1)
-        model.reset()
+            for b_idx in range(batch_size):
+                for cell in self.cells:
+                    cell.reset()
+                for t in range(seq_len):
+                    for c_idx, cell in enumerate(self.cells):
+                        st = cell.step(
+                            float(a_ctrl[b_idx, t, c_idx].item()),
+                            float(b_ctrl[b_idx, t, c_idx].item()),
+                            int(ext_ctrl[b_idx, t, c_idx].item()),
+                        )
+                        out[b_idx, t, c_idx] = np.asarray(st, dtype=np.float32)
 
-        previous = (
-            self.start
-            if self.start in model.tok_to_id
-            else model.vocab[0]
-        )
-        state = model.encode([previous])[-1]
+        return torch.from_numpy(out).to(ngram_repr.device).view(batch_size, seq_len, -1)
 
-        generated = []
-        seen_count = 0
-        coherence_count = 0
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        controlled_repr, geom_summary = self.encode_ngrams(input_ids)
+        res_states = self.rollout_reservoir(controlled_repr)
+        combined = torch.cat([res_states, controlled_repr, geom_summary], dim=-1)
+        return self.readout(combined)
 
-        for _ in range(n):
-            probabilities = model.probs(state, temp)[0]
-            next_token = model.id_to_tok[
-                model.rng.choice(model.vocab_size, p=probabilities)
-            ]
-
-            seen_count += (previous, next_token) in self.seen
-            coherence_count += (
-                next_token.split()[:2] == previous.split()[1:]
-            )
-
-            generated.append(next_token)
-            previous = next_token
-            state = model.encode([next_token])[-1]
-
-        model.reset()
-
-        diversity = len(set(generated)) / max(1, n)
-        seen_score = seen_count / max(1, n)
-        coherence = coherence_count / max(1, n)
-
-        a, b, c, d = self.weights
-        composite = (
-            a * likelihood
-            + b * seen_score
-            + c * coherence
-            + d * diversity
-        )
-
-        return {
-            "likelihood": float(likelihood),
-            "seen": float(seen_score),
-            "coherence": float(coherence),
-            "diversity": float(diversity),
-            "composite": float(composite),
-        }
+    @torch.no_grad()
+    def generate(
+        self,
+        prompt_ids: list[int],
+        max_new_tokens: int = 50,
+        temperature: float = 0.8,
+    ) -> list[int]:
+        self.eval()
+        tokens = list(prompt_ids)
+        device = next(self.parameters()).device
+        for _ in range(max_new_tokens):
+            x = torch.tensor([tokens[-64:]], dtype=torch.long, device=device)
+            logits = self(x)[:, -1, :] / max(temperature, 1e-5)
+            probs = torch.softmax(logits, dim=-1)
+            next_id = int(torch.multinomial(probs, num_samples=1).item())
+            tokens.append(next_id)
+        return tokens
 
 
-# ============================================================
-# 3. EXECUTION
-# ============================================================
+def tokenize_words(text: str) -> list[str]:
+    """Split text into word tokens and punctuation tokens (lowercased)."""
+    return text.lower().split()
 
-def main():
-    filename = input("Primary filename: ").strip()
 
-    try:
-        with open(filename, "r", encoding="utf-8") as file:
-            primary = file.read()[:KB_LIMIT]
-    except OSError as error:
-        print(f"Could not open file: {error}")
-        return
+def tokenize_trigrams(text: str) -> list[tuple[str, str, str]]:
+    """Return word trigrams from lowercased whitespace-split tokens."""
+    tokens = tokenize_words(text)
+    return list(zip(tokens, tokens[1:], tokens[2:]))
 
-    if len(primary.split()) < 6:
-        print("Please provide a source file containing at least six words.")
-        return
 
-    print("\\n--- TRAINING ---")
-    model = WordOptoelectronicLLM(primary, [primary]).train()
-
-    print("\\n--- NATURALNESS ASSESSMENT ---")
-    assessor = NaturalnessAssessor(primary)
-    scores = assessor.assess(model)
-    for name, value in scores.items():
-        print(f"{name}: {value:.4f}")
-
-    print("\\n--- MODEL READY ---")
-    print("Vector operator: V(lambda) = sign(lambda) * abs(lambda)**(1/5)")
-    print("Type /quit to stop.")
-
-    while True:
-        try:
-            prompt = input("\\nUSER: ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print("\\nExiting.")
-            break
-
-        if prompt.lower() in {"/quit", "quit", "exit"}:
-            break
-        if not prompt:
+def detokenize_words(tokens: list[str]) -> str:
+    """Join word and punctuation tokens with clean spacing."""
+    out = []
+    for tok in tokens:
+        if tok in {"<pad>", "<unk>"}:
             continue
+        if out and re.match(r"^[^\w\s]+$", tok):
+            out[-1] = out[-1] + tok
+        elif out:
+            out.append(" " + tok)
+        else:
+            out.append(tok)
+    return "".join(out)
 
-        print("MODEL:", model.generate(prompt, 250, 10.0))
 
-
+# --- Quick smoke test on sample text ---
 if __name__ == "__main__":
-    main()
+    with open(input("Filename: "), "r", encoding="utf-8") as file:
+        corpus = file.read()
+
+    words = tokenize_words(corpus)
+    special_tokens = ["<pad>", "<unk>"]
+    vocab = special_tokens + words
+    stoi = {w: i for i, w in enumerate(vocab)}
+    itos = {i: w for i, w in enumerate(vocab)}
+    pad_id = stoi["<pad>"]
+    unk_id = stoi["<unk>"]
+
+    data = torch.tensor([stoi.get(w, unk_id) for w in words], dtype=torch.long)
+    ngram_size = 5
+    seq_len = min(24, max(1, len(data) - 1))
+    batch_size = 8
+
+    model = NGramReservoirLLM(
+        vocab_size=len(vocab),
+        pad_id=pad_id,
+        n=ngram_size,
+        num_cells=16,
+        hidden_dim=64,
+        num_geom_replicas=4,
+    )
+    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-3)
+    criterion = nn.CrossEntropyLoss()
+
+    for step_idx in range(150):
+        ix = torch.randint(0, len(data) - seq_len - 1, (batch_size,))
+        x = torch.stack([data[i : i + seq_len] for i in ix])
+        y = torch.stack([data[i + 1 : i + 1 + seq_len] for i in ix])
+
+        optimizer.zero_grad()
+        logits = model(x)
+        loss = criterion(logits.view(-1, len(vocab)), y.view(-1))
+        loss.backward()
+        optimizer.step()
+
+        if (step_idx + 1) % 30 == 0:
+            print(f"Step {step_idx + 1:3d} | Loss: {loss.item():.4f}")
+
+    prompt_words = tokenize_words("what are the truths about God")
+    prompt_ids = [stoi.get(w, unk_id) for w in prompt_words]
+    generated_ids = model.generate(prompt_ids, max_new_tokens=80)
+    print("Generated:", detokenize_words([itos[i] for i in list(reversed(generated_ids))]))
