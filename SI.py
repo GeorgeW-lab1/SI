@@ -1,415 +1,1119 @@
-from collections import deque
-import math
+#!/usr/bin/env python3
+"""
+RUBBER AI - FIXED SKELETON + REINFORCEMENT LEARNING
+===================================================
+
+Uses the settings from:
+    rubber_programs/rubber_0d25c38b2853.rbc
+
+No generated programs. No compiler. No factory framework.
+
+Pipeline:
+    filename -> tokenize -> spatial encode -> trigram learn
+             -> sequential state -> RL train -> prompt -> generate
+"""
+
+import os
 import re
-import numpy as np
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
+import json
+import math
+import shlex
+import random
+import hashlib
+import secrets
+
+from collections import Counter, defaultdict
 
 
-class V(np.ndarray):
-    """Lightweight ndarray subclass for V(...)."""
-    def __new__(cls, input_array):
-        return np.asarray(input_array, dtype=float).view(cls)
+VERSION = "3.1"
+
+# ============================================================
+# FIXED PROGRAM SKELETON
+# ============================================================
+
+PROGRAM_ID = "0d25c38b2853"
+
+SETTINGS = {
+    "space_bits": 14,
+    "space_dimensions": 3,
+    "trigram_order": 3,
+
+    "math_level1_scale": 1.1182,
+    "math_level2_mode": "AVERAGE",
+    "math_level2_weight": 0.5806,
+
+    "probability_smoothing": 0.054,
+    "probability_temperature": 0.5196,
+    "probability_spatial": 0.2461,
+
+    "rl_rate": 0.08,
+    "rl_temperature": 0.8,
+    "rl_exploration": 0.08,
+    "rl_episodes": 40,
+    "rl_length": 24
+}
 
 
-class ReservoirCell:
-    def __init__(self, high=3.5, low=1.5, dt=0.1, tau=1.0, vth=0.7, delay_len=4, seed=42):
-        self.high = high
-        self.low = low
-        self.dt = dt
-        self.tau = tau
-        self.vth = vth
-        self.rng = np.random.default_rng(seed)
-        self.delay_len = delay_len
-        self.reset()
+# ============================================================
+# UTILITIES
+# ============================================================
 
-    def reset(self):
-        self.steps = 0
-        self.driver = 0.0
-        self.vrc = 0.0
-        self.top = 0.0
-        self.bot = 0.0
-        self.delay = deque([0] * self.delay_len, maxlen=self.delay_len)
-        self.clock = 0
-        self.dff = 0
-        self.probe = 0.0
-
-    def step(self, a, b, ext=0):
-        self.steps += 1
-
-        # Hysteretic driver.
-        if a >= self.high:
-            self.driver = 5.0
-        elif a <= self.low:
-            self.driver = 0.0
-
-        # RC reservoir response.
-        self.vrc += (self.driver - self.vrc) * self.dt / self.tau
-
-        if self.vrc > self.vth:
-            self.vrc -= 0.65 * (self.vrc - self.vth)
-            node = self.vth + (self.vrc - self.vth) * 0.2
-        else:
-            node = self.vrc
-
-        self.top = 0.25 * node + 0.75 * self.top
-        self.bot = 0.25 * b + 0.75 * self.bot
-
-        ct = int(self.top > 0.5)
-        cb = int(self.bot > 0.5)
-        gate = ct & cb
-
-        delayed = self.delay[0]
-        self.delay.append(gate)
-
-        clk = cb | int(bool(ext))
-        if clk and not self.clock:
-            self.dff = delayed
-        self.clock = clk
-
-        # Keep bitwise logic integer-only; convert to float afterward.
-        raw_top_logic = int(a > 2.5)
-        sec_and = raw_top_logic & int(delayed)
-        probability = np.clip(
-            sec_and * 0.8 + self.rng.normal(0.0, 0.15), 0.0, 1.0
-        )
-        self.probe = 0.7 * self.probe + 0.3 * probability
-
-        state = np.array([
-            self.driver / 5.0,
-            self.vrc / 0.7,
-            self.top / 5.0,
-            self.bot / 5.0,
-            gate,
-            delayed,
-            self.dff,
-            self.probe * (1.0 if self.steps % 2 == 0 else 0.5),
-        ], dtype=float)
-
-        # Apply the fifth-root vector operator to every reservoir state.
-        return V(sorted(np.log(np.exp(state))))
+def tokenize(text):
+    return re.findall(
+        r"[A-Za-z0-9_]+|[^\w\s]",
+        text.lower()
+    )
 
 
-class SyntacticGeometryLayer(nn.Module):
-    """
-    Applies a syntactic geometry layer over an n-gram window (batch, seq_len, n, dim):
-      1. Encodes syntactic role/offset phase across window positions (relative to head w_t).
-      2. Computes geometric transition features (stepwise deltas, head-relative deltas,
-         and cosine similarities) capturing syntactic relations in embedding space.
-      3. Replicates/expands geometric structure across k syntactic channels to control
-         the current layer's representation via gated modulation.
-    """
-    def __init__(self, n: int, hidden_dim: int, num_geom_replicas: int = 4):
-        super().__init__()
-        self.n = n
-        self.hidden_dim = hidden_dim
-        self.num_geom_replicas = num_geom_replicas
+def digest(text):
+    return hashlib.sha256(
+        text.encode("utf-8")
+    ).hexdigest()
 
-        # Syntactic offset embeddings for positions 0..n-1 (index n-1 is current head word t)
-        self.syntax_pos_emb = nn.Parameter(torch.randn(1, 1, n, hidden_dim) * 0.02)
 
-        # Geometric feature dim per token in window:
-        #   base (hidden_dim) + stepwise_delta (hidden_dim) + head_delta (hidden_dim) + cos_to_head (1)
-        geom_in_dim = hidden_dim * 3 + 1
+def hash_value(text):
+    return int.from_bytes(
+        hashlib.sha256(
+            text.encode("utf-8")
+        ).digest()[:4],
+        "big"
+    )
 
-        # Replicate geometric manifold across K syntactic channels
-        self.replicate_proj = nn.Linear(n * geom_in_dim, hidden_dim * num_geom_replicas)
-        self.norm = nn.LayerNorm(hidden_dim)
 
-        # Syntactic controller: produces a gate & shift to steer the current layer
-        self.syntax_controller = nn.Sequential(
-            nn.Linear(hidden_dim * (num_geom_replicas + 1), hidden_dim * 2),
-            nn.GELU(),
-            nn.Linear(hidden_dim * 2, hidden_dim * 2),  # [gate_logits, delta_shift]
+def clamp(value, low, high):
+    return max(low, min(high, value))
+
+
+# ============================================================
+# SPATIAL BINARY ENGINE
+# ============================================================
+
+class RubberSpace:
+
+    def __init__(self, bits=SETTINGS["space_bits"]):
+        self.bits = bits
+        self.limit = 1 << bits
+        self.positions = []
+
+    def encode(self, token, position):
+        h = hash_value(token)
+
+        x = h % self.limit
+        y = ((h >> 8) + position) % self.limit
+        z = ((h >> 16) ^ position) % self.limit
+
+        return {
+            "token": token,
+            "position": position,
+            "xyz": (x, y, z),
+            "binary": (
+                format(x, f"0{self.bits}b"),
+                format(y, f"0{self.bits}b"),
+                format(z, f"0{self.bits}b")
+            )
+        }
+
+    def encode_dataset(self, tokens):
+        self.positions = [
+            self.encode(token, index)
+            for index, token in enumerate(tokens)
+        ]
+
+        return self.positions
+
+    def affinity(self, a, b):
+        distance = math.sqrt(
+            sum(
+                (a[index] - b[index]) ** 2
+                for index in range(3)
+            )
         )
 
-    def _apply_rotary_syntax_phase(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Applies deterministic syntactic phase rotation along token offsets relative to head (n-1).
-        x: (batch, seq_len, n, dim)
-        """
-        _, _, n, dim = x.shape
-        half_dim = dim // 2
-        if half_dim == 0:
-            return x
-
-        # Relative syntactic distance from head word: -(n-1), ..., -1, 0
-        offsets = torch.arange(n, device=x.device, dtype=x.dtype) - float(n - 1)
-        freqs = torch.exp(
-            -math.log(10000.0) * torch.arange(half_dim, device=x.device, dtype=x.dtype) / max(half_dim, 1)
-        )
-        angles = offsets[:, None] * freqs[None, :]  # (n, half_dim)
-        cos_a = torch.cos(angles)[None, None, :, :]
-        sin_a = torch.sin(angles)[None, None, :, :]
-
-        x_even = x[..., : 2 * half_dim : 2]
-        x_odd = x[..., 1 : 2 * half_dim : 2]
-        rot_even = x_even * cos_a - x_odd * sin_a
-        rot_odd = x_even * sin_a + x_odd * cos_a
-
-        rotated = x.clone()
-        rotated[..., : 2 * half_dim : 2] = rot_even
-        rotated[..., 1 : 2 * half_dim : 2] = rot_odd
-        return rotated
-
-    def forward(self, win_emb: torch.Tensor, current_layer_repr: torch.Tensor):
-        """
-        win_emb: (batch, seq_len, n, hidden_dim)
-        current_layer_repr: (batch, seq_len, hidden_dim)
-        Returns:
-          controlled_repr: (batch, seq_len, hidden_dim)
-          geom_summary: (batch, seq_len, hidden_dim)
-        """
-        batch_size, seq_len, n, dim = win_emb.shape
-
-        # 1. Inject syntactic position & rotary phase geometry
-        geom_tokens = self._apply_rotary_syntax_phase(win_emb + self.syntax_pos_emb)
-
-        # Head word (current token t) is at index n - 1
-        head_tok = geom_tokens[:, :, -1:, :].expand(-1, -1, n, -1)
-
-        # Stepwise syntactic transition: v_k - v_{k-1} (with zero delta at k=0)
-        prev_tokens = torch.cat(
-            [geom_tokens[:, :, :1, :], geom_tokens[:, :, :-1, :]], dim=2
-        )
-        step_delta = geom_tokens - prev_tokens
-
-        # Geometric offset to syntactic head: v_k - v_head
-        head_delta = geom_tokens - head_tok
-
-        # Cosine similarity with head word as scalar geometric alignment
-        cos_sim = F.cosine_similarity(geom_tokens, head_tok, dim=-1).unsqueeze(-1)
-
-        geom_features = torch.cat([geom_tokens, step_delta, head_delta, cos_sim], dim=-1)
-        flat_geom = geom_features.reshape(batch_size, seq_len, -1)
-
-        # 2. Replicate across K syntactic geometric channels
-        replicated = self.replicate_proj(flat_geom)  # (batch, seq_len, K * dim)
-        geom_summary = self.norm(
-            replicated.view(batch_size, seq_len, self.num_geom_replicas, dim).mean(dim=2)
+        maximum = math.sqrt(
+            3 * (self.limit - 1) ** 2
         )
 
-        # 3. Syntactically control the current layer
-        ctrl_in = torch.cat([replicated, current_layer_repr], dim=-1)
-        gate_logits, shift = self.syntax_controller(ctrl_in).chunk(2, dim=-1)
-        syntax_gate = torch.sigmoid(gate_logits)
-
-        controlled_repr = self.norm(
-            current_layer_repr * (0.5 + syntax_gate) + shift * syntax_gate
-        )
-        return controlled_repr, geom_summary
+        return 1.0 - distance / maximum
 
 
-class NGramReservoirLLM(nn.Module):
-    """
-    Word n-gram reservoir language model with a SyntacticGeometryLayer that replicates
-    geometric syntactic relations to control the current layer before driving the reservoir.
-    """
-    def __init__(
+# ============================================================
+# TWO-LEVEL ARITHMETIC
+# ============================================================
+
+class RubberMath:
+
+    def __init__(self):
+        self.mode = SETTINGS["math_level2_mode"]
+        self.scale = SETTINGS["math_level1_scale"]
+        self.weight = SETTINGS["math_level2_weight"]
+
+        self.local_state = 0.0
+        self.global_state = 0.0
+
+    def level_one(
         self,
-        vocab_size: int,
-        pad_id: int,
-        n: int = 3,
-        num_cells: int = 32,
-        hidden_dim: int = 128,
-        num_geom_replicas: int = 4,
-        seed: int = 42,
+        value,
+        position,
+        affinity,
+        prompt_state
     ):
-        super().__init__()
-        if n < 1:
-            raise ValueError("n must be >= 1")
-        self.vocab_size = vocab_size
-        self.pad_id = pad_id
-        self.n = n
-        self.num_cells = num_cells
-        self.hidden_dim = hidden_dim
-        self.cells = [ReservoirCell(seed=seed + i) for i in range(num_cells)]
-
-        # Embedding for each of the n words in the n-gram: (t-n+1, ..., t)
-        self.token_emb = nn.Embedding(vocab_size, hidden_dim)
-        self.ngram_proj = nn.Sequential(
-            nn.Linear(hidden_dim * n, hidden_dim),
-            nn.GELU(),
+        result = (
+            value * self.scale
+            + position * 0.001
+            + affinity * 0.5
+            + prompt_state * 0.5
         )
 
-        # Syntactic geometry layer controlling the current layer
-        self.syntax_geom = SyntacticGeometryLayer(
-            n=n,
-            hidden_dim=hidden_dim,
-            num_geom_replicas=num_geom_replicas,
-        )
+        self.local_state = math.tanh(result)
+        return self.local_state
 
-        # Syntactically controlled n-gram context -> controls (a, b, ext) per cell
-        self.to_controls = nn.Linear(hidden_dim, num_cells * 3)
+    def level_two(self, value, previous=None):
+        if previous is None:
+            previous = self.global_state
 
-        # Reservoir state + controlled n-gram + syntactic geometry summary -> next-word logits
-        self.readout = nn.Sequential(
-            nn.Linear(num_cells * 8 + hidden_dim * 2, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, vocab_size),
-        )
+        if self.mode == "ADD":
+            result = value + previous * self.weight
 
-    def build_ngram_windows(self, input_ids: torch.Tensor) -> torch.Tensor:
-        """
-        input_ids: (batch, seq_len)
-        returns windows: (batch, seq_len, n) where index -1 is current word t
-        and index 0 is t - n + 1.
-        """
-        batch_size, seq_len = input_ids.shape
-        if self.n > 1:
-            pad = torch.full(
-                (batch_size, self.n - 1),
-                self.pad_id,
-                dtype=input_ids.dtype,
-                device=input_ids.device,
+        elif self.mode == "MULTIPLY":
+            result = value * (
+                1.0 + previous * self.weight
             )
-            padded = torch.cat([pad, input_ids], dim=1)
+
+        elif self.mode == "AVERAGE":
+            result = (value + previous) / 2.0
+
+        elif self.mode == "SUBTRACT":
+            result = value - previous * self.weight
+
         else:
-            padded = input_ids
+            result = value + previous * self.weight
 
-        slices = [padded[:, k : k + seq_len] for k in range(self.n)]
-        return torch.stack(slices, dim=-1)
+        self.global_state = math.tanh(result)
+        return self.global_state
 
-    def encode_ngrams(self, input_ids: torch.Tensor):
-        """
-        returns:
-          controlled_repr: (batch, seq_len, hidden_dim)
-          geom_summary: (batch, seq_len, hidden_dim)
-        """
-        windows = self.build_ngram_windows(input_ids)  # (batch, seq_len, n)
-        win_emb = self.token_emb(windows)  # (batch, seq_len, n, hidden_dim)
-        flat_ngram = win_emb.flatten(start_dim=2)  # (batch, seq_len, n * hidden_dim)
-        base_repr = self.ngram_proj(flat_ngram)  # (batch, seq_len, hidden_dim)
 
-        controlled_repr, geom_summary = self.syntax_geom(win_emb, base_repr)
-        return controlled_repr, geom_summary
+# ============================================================
+# TRIGRAM LANGUAGE ENGINE
+# ============================================================
 
-    def rollout_reservoir(self, ngram_repr: torch.Tensor) -> torch.Tensor:
-        """
-        ngram_repr: (batch, seq_len, hidden_dim)
-        returns reservoir_feats: (batch, seq_len, num_cells * 8)
-        """
-        batch_size, seq_len, _ = ngram_repr.shape
-        with torch.no_grad():
-            raw_ctrl = self.to_controls(ngram_repr).view(
-                batch_size, seq_len, self.num_cells, 3
+class RubberTrigrams:
+
+    def __init__(self):
+        self.trigrams = defaultdict(Counter)
+        self.bigrams = defaultdict(Counter)
+        self.unigrams = Counter()
+        self.vocabulary = set()
+        self.smoothing = SETTINGS[
+            "probability_smoothing"
+        ]
+
+    def learn(self, tokens):
+        self.vocabulary.update(tokens)
+        self.unigrams.update(tokens)
+
+        for index in range(len(tokens) - 1):
+            self.bigrams[
+                tokens[index]
+            ][tokens[index + 1]] += 1
+
+        for index in range(len(tokens) - 3):
+            context = tuple(tokens[index:index + 3])
+            target = tokens[index + 3]
+
+            self.trigrams[context][target] += 1
+
+    def observed_transitions(self):
+        transitions = set()
+
+        for context, counter in self.trigrams.items():
+            for target in counter:
+                transitions.add(
+                    context + (target,)
+                )
+
+        return transitions
+
+    def candidates(self, context):
+        context = tuple(context[-3:])
+
+        if context in self.trigrams:
+            return self.trigrams[context], "TRIGRAM"
+
+        if context and context[-1] in self.bigrams:
+            return self.bigrams[context[-1]], "BIGRAM"
+
+        if self.unigrams:
+            return self.unigrams, "UNIGRAM"
+
+        return Counter(), "NONE"
+
+
+# ============================================================
+# REINFORCEMENT-LEARNING POLICY
+# ============================================================
+
+class RubberRLPolicy:
+    """
+    REINFORCE-style policy over next-token choices.
+
+    preference[context][token] is updated using:
+
+        preference += learning_rate * (reward - baseline)
+    """
+
+    def __init__(self):
+        self.preferences = defaultdict(dict)
+
+        self.learning_rate = SETTINGS["rl_rate"]
+        self.temperature = SETTINGS["rl_temperature"]
+        self.exploration = SETTINGS["rl_exploration"]
+        self.l2 = 0.001
+
+        self.episodes = 0
+        self.updates = 0
+        self.total_reward = 0.0
+
+    def choose(self, context, candidates, rng):
+        if not candidates:
+            return None
+
+        context = tuple(context[-3:])
+        preferences = self.preferences[context]
+
+        for token in candidates:
+            preferences.setdefault(token, 0.0)
+
+        if rng.random() < self.exploration:
+            return rng.choice(list(candidates))
+
+        maximum = max(
+            preferences[token]
+            for token in candidates
+        )
+
+        tokens = []
+        weights = []
+
+        for token in candidates:
+            preference = preferences[token]
+
+            weight = math.exp(
+                (preference - maximum)
+                / self.temperature
             )
-            a_ctrl = torch.sigmoid(raw_ctrl[..., 0]) * 5.0
-            b_ctrl = torch.sigmoid(raw_ctrl[..., 1]) * 5.0
-            ext_ctrl = (raw_ctrl[..., 2] > 0.0).to(torch.int64)
 
-            out = np.zeros((batch_size, seq_len, self.num_cells, 8), dtype=np.float32)
+            tokens.append(token)
+            weights.append(weight)
 
-            for b_idx in range(batch_size):
-                for cell in self.cells:
-                    cell.reset()
-                for t in range(seq_len):
-                    for c_idx, cell in enumerate(self.cells):
-                        st = cell.step(
-                            float(a_ctrl[b_idx, t, c_idx].item()),
-                            float(b_ctrl[b_idx, t, c_idx].item()),
-                            int(ext_ctrl[b_idx, t, c_idx].item()),
-                        )
-                        out[b_idx, t, c_idx] = np.asarray(st, dtype=np.float32)
+        return rng.choices(
+            tokens,
+            weights=weights,
+            k=1
+        )[0]
 
-        return torch.from_numpy(out).to(ngram_repr.device).view(batch_size, seq_len, -1)
+    def update(self, context, action, reward, baseline):
+        if action is None:
+            return
 
-    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
-        controlled_repr, geom_summary = self.encode_ngrams(input_ids)
-        res_states = self.rollout_reservoir(controlled_repr)
-        combined = torch.cat([res_states, controlled_repr, geom_summary], dim=-1)
-        return self.readout(combined)
+        context = tuple(context[-3:])
+        preferences = self.preferences[context]
 
-    @torch.no_grad()
+        preferences.setdefault(action, 0.0)
+
+        advantage = reward - baseline
+
+        preferences[action] += (
+            self.learning_rate * advantage
+        )
+
+        for token in preferences:
+            preferences[token] *= (1.0 - self.l2)
+
+        self.updates += 1
+        self.total_reward += reward
+
+    def train_episode(self, episode):
+        self.episodes += 1
+
+        rewards = [
+            step["reward"]
+            for step in episode
+        ]
+
+        if not rewards:
+            return 0.0
+
+        baseline = sum(rewards) / len(rewards)
+
+        for step in episode:
+            self.update(
+                step["context"],
+                step["action"],
+                step["reward"],
+                baseline
+            )
+
+        return baseline
+
+    def export(self):
+        return {
+            "learning_rate": self.learning_rate,
+            "temperature": self.temperature,
+            "exploration": self.exploration,
+            "l2": self.l2,
+            "episodes": self.episodes,
+            "updates": self.updates,
+            "total_reward": self.total_reward,
+            "preferences": {
+                " ".join(context): dict(values)
+                for context, values
+                in self.preferences.items()
+            }
+        }
+
+    def import_policy(self, data):
+        self.learning_rate = data.get(
+            "learning_rate",
+            self.learning_rate
+        )
+
+        self.temperature = data.get(
+            "temperature",
+            self.temperature
+        )
+
+        self.exploration = data.get(
+            "exploration",
+            self.exploration
+        )
+
+        self.l2 = data.get("l2", self.l2)
+        self.episodes = data.get("episodes", 0)
+        self.updates = data.get("updates", 0)
+        self.total_reward = data.get(
+            "total_reward",
+            0.0
+        )
+
+        for context, values in data.get(
+            "preferences",
+            {}
+        ).items():
+            self.preferences[
+                tuple(context.split())
+            ] = dict(values)
+
+
+# ============================================================
+# RUBBER AI ENGINE
+# ============================================================
+
+class RubberAI:
+
+    def __init__(self):
+        self.space = RubberSpace()
+        self.math = RubberMath()
+        self.language = RubberTrigrams()
+        self.policy = RubberRLPolicy()
+
+        self.dataset = []
+        self.spatial_dataset = []
+        self.dataset_hash = ""
+
+        self.dataset_state = 0.0
+        self.prompt = ""
+        self.prompt_state = 0.0
+
+        self.ready = False
+
+        self.observed_trigrams = set()
+        self.observed_bigrams = set()
+
+    # --------------------------------------------------------
+    # LOAD FILE
+    # --------------------------------------------------------
+
+    def load_dataset(self, filename):
+        print(f"\n[RUBBER] Loading: {filename}")
+
+        with open(
+            filename,
+            "r",
+            encoding="utf-8",
+            errors="replace"
+        ) as file:
+            text = file.read()
+
+        self.dataset = tokenize(text)
+
+        if len(self.dataset) < 6:
+            raise ValueError(
+                "Dataset must contain at least six tokens."
+            )
+
+        self.dataset_hash = digest(text)
+
+        print(
+            "[RUBBER] Tokens:",
+            len(self.dataset)
+        )
+
+        print(
+            "[RUBBER] Dataset hash:",
+            self.dataset_hash[:16]
+        )
+
+        self.space = RubberSpace()
+        self.math = RubberMath()
+        self.language = RubberTrigrams()
+        self.policy = RubberRLPolicy()
+
+        self.spatial_dataset = (
+            self.space.encode_dataset(
+                self.dataset
+            )
+        )
+
+        self.language.learn(self.dataset)
+
+        self.observed_trigrams = (
+            self.language.observed_transitions()
+        )
+
+        self.observed_bigrams = set()
+
+        for source, targets in (
+            self.language.bigrams.items()
+        ):
+            for target in targets:
+                self.observed_bigrams.add(
+                    (source, target)
+                )
+
+        self.execute_dataset_sequence()
+        self.train_policy()
+
+        self.ready = True
+
+        print("[RUBBER] Dataset ready.")
+
+    # --------------------------------------------------------
+    # SEQUENTIAL STATE
+    # --------------------------------------------------------
+
+    def execute_dataset_sequence(self):
+        previous = None
+        state = 0.0
+
+        for item in self.spatial_dataset:
+
+            if previous is None:
+                affinity = 0.5
+            else:
+                affinity = self.space.affinity(
+                    item["xyz"],
+                    previous
+                )
+
+            value = (
+                hash_value(item["token"])
+                / 4294967295.0
+            )
+
+            local = self.math.level_one(
+                value,
+                item["position"],
+                affinity,
+                0.0
+            )
+
+            state = self.math.level_two(
+                local,
+                state
+            )
+
+            previous = item["xyz"]
+
+        self.dataset_state = state
+
+    # --------------------------------------------------------
+    # REINFORCEMENT LEARNING
+    # --------------------------------------------------------
+
+    def reward_step(
+        self,
+        context,
+        action,
+        generated,
+        prompt_tokens
+    ):
+        reward = 0.0
+
+        context = tuple(context[-3:])
+        transition = context + (action,)
+
+        if transition in self.observed_trigrams:
+            reward += 1.0
+
+        if (
+            context[-1],
+            action
+        ) in self.observed_bigrams:
+            reward += 0.35
+
+        if action in self.language.vocabulary:
+            reward += 0.10
+
+        if action in prompt_tokens:
+            reward += 0.25
+
+        recent = generated[-8:]
+
+        if action in recent:
+            reward -= 0.35 * (
+                recent.count(action)
+                / max(len(recent), 1)
+            )
+
+        recent_window = generated[-12:]
+
+        unique_recent = len(set(recent_window))
+
+        reward += 0.10 * (
+            unique_recent
+            / max(len(recent_window), 1)
+        )
+
+        return reward
+
+    def run_generation_episode(
+        self,
+        seed_tokens,
+        length,
+        prompt_tokens,
+        rng
+    ):
+        context = list(seed_tokens[-3:])
+
+        if len(context) < 3:
+            context = (
+                self.dataset[:3] + context
+            )[-3:]
+
+        generated = []
+        episode = []
+
+        for _ in range(length):
+            candidates, mode = (
+                self.language.candidates(context)
+            )
+
+            if not candidates:
+                break
+
+            action = self.policy.choose(
+                context,
+                list(candidates),
+                rng
+            )
+
+            if action is None:
+                break
+
+            reward = self.reward_step(
+                context,
+                action,
+                generated,
+                prompt_tokens
+            )
+
+            episode.append(
+                {
+                    "context": tuple(context[-3:]),
+                    "action": action,
+                    "reward": reward
+                }
+            )
+
+            generated.append(action)
+
+            context.append(action)
+            context = context[-3:]
+
+        return generated, episode
+
+    def train_policy(
+        self,
+        episodes=SETTINGS["rl_episodes"],
+        length=SETTINGS["rl_length"]
+    ):
+        if not self.dataset:
+            raise RuntimeError(
+                "Load a dataset first."
+            )
+
+        rng = random.Random(
+            secrets.randbits(64)
+        )
+
+        print(
+            f"\n[RUBBER] RL training: "
+            f"{episodes} episodes x {length} tokens"
+        )
+
+        total_reward = 0.0
+
+        for _ in range(episodes):
+            start = rng.randrange(
+                max(1, len(self.dataset) - 3)
+            )
+
+            seed_tokens = self.dataset[
+                start:start + 3
+            ]
+
+            generated, episode = (
+                self.run_generation_episode(
+                    seed_tokens,
+                    length,
+                    [],
+                    rng
+                )
+            )
+
+            average_reward = (
+                self.policy.train_episode(episode)
+            )
+
+            total_reward += average_reward
+
+        print(
+            "[RUBBER] RL training complete. "
+            f"Average reward: "
+            f"{total_reward / max(episodes, 1):.4f}"
+        )
+
+    # --------------------------------------------------------
+    # PROMPT
+    # --------------------------------------------------------
+
+    def set_prompt(self, prompt):
+        self.prompt = prompt
+
+        tokens = tokenize(prompt)
+        value = 0.0
+
+        for index, token in enumerate(tokens):
+            value += (
+                hash_value(token)
+                / 4294967295.0
+            ) / (index + 1)
+
+        self.prompt_state = math.tanh(value)
+
+        print("[RUBBER] Prompt initialized.")
+
+    # --------------------------------------------------------
+    # GENERATION
+    # --------------------------------------------------------
+
     def generate(
         self,
-        prompt_ids: list[int],
-        max_new_tokens: int = 50,
-        temperature: float = 0.8,
-    ) -> list[int]:
-        self.eval()
-        tokens = list(prompt_ids)
-        device = next(self.parameters()).device
-        for _ in range(max_new_tokens):
-            x = torch.tensor([tokens[-64:]], dtype=torch.long, device=device)
-            logits = self(x)[:, -1, :] / max(temperature, 1e-5)
-            probs = torch.softmax(logits, dim=-1)
-            next_id = int(torch.multinomial(probs, num_samples=1).item())
-            tokens.append(next_id)
-        return tokens
+        length=100,
+        learn_online=True
+    ):
+        if not self.ready:
+            raise RuntimeError(
+                "Load a dataset first."
+            )
+
+        prompt_tokens = tokenize(self.prompt)
+
+        context = prompt_tokens[-3:]
+
+        if len(context) < 3:
+            context = (
+                self.dataset[:3] + context
+            )[-3:]
+
+        state = (
+            self.dataset_state + self.prompt_state
+        ) / 2.0
+
+        output = []
+        episode = []
+
+        previous_position = None
+
+        rng = random.Random(
+            secrets.randbits(64)
+        )
+
+        for step in range(length):
+            item = self.spatial_dataset[
+                step % len(self.spatial_dataset)
+            ]
+
+            if previous_position is None:
+                affinity = 0.5
+            else:
+                affinity = self.space.affinity(
+                    item["xyz"],
+                    previous_position
+                )
+
+            previous_position = item["xyz"]
+
+            value = (
+                hash_value(item["token"])
+                / 4294967295.0
+            )
+
+            local = self.math.level_one(
+                value,
+                item["position"],
+                affinity,
+                self.prompt_state
+            )
+
+            state = self.math.level_two(
+                local,
+                state
+            )
+
+            candidates, mode = (
+                self.language.candidates(context)
+            )
+
+            if not candidates:
+                break
+
+            action = self.policy.choose(
+                context,
+                list(candidates),
+                rng
+            )
+
+            if action is None:
+                break
+
+            reward = self.reward_step(
+                context,
+                action,
+                output,
+                prompt_tokens
+            )
+
+            episode.append(
+                {
+                    "context": tuple(context[-3:]),
+                    "action": action,
+                    "reward": reward
+                }
+            )
+
+            output.append(action)
+
+            context.append(action)
+            context = context[-3:]
+
+            generated_value = (
+                hash_value(action)
+                / 4294967295.0
+            )
+
+            local = self.math.level_one(
+                generated_value,
+                step,
+                0.5,
+                self.prompt_state
+            )
+
+            state = self.math.level_two(
+                local,
+                state
+            )
+
+        if learn_online and episode:
+            self.policy.train_episode(episode)
+
+        result = " ".join(output)
+
+        result = re.sub(
+            r"\s+([.,!?;:])",
+            r"\1",
+            result
+        )
+
+        return result
+
+    # --------------------------------------------------------
+    # STATUS
+    # --------------------------------------------------------
+
+    def status(self):
+        return {
+            "version": VERSION,
+            "program_id": PROGRAM_ID,
+            "ready": self.ready,
+            "dataset_tokens": len(self.dataset),
+            "vocabulary": len(
+                self.language.vocabulary
+            ),
+            "trigrams": len(
+                self.language.trigrams
+            ),
+            "dataset_state": self.dataset_state,
+            "prompt_state": self.prompt_state,
+            "rl_episodes": self.policy.episodes,
+            "rl_updates": self.policy.updates,
+            "rl_total_reward": (
+                self.policy.total_reward
+            ),
+            "settings": SETTINGS
+        }
+
+    # --------------------------------------------------------
+    # SAVE / LOAD
+    # --------------------------------------------------------
+
+    def save(self, filename):
+        if not self.ready:
+            raise RuntimeError(
+                "No trained dataset."
+            )
+
+        data = {
+            "version": VERSION,
+            "program_id": PROGRAM_ID,
+            "settings": SETTINGS,
+            "dataset": self.dataset,
+            "dataset_hash": self.dataset_hash,
+            "unigrams": dict(
+                self.language.unigrams
+            ),
+            "bigrams": [
+                {
+                    "context": context,
+                    "counts": dict(counts)
+                }
+                for context, counts
+                in self.language.bigrams.items()
+            ],
+            "trigrams": [
+                {
+                    "context": list(context),
+                    "counts": dict(counts)
+                }
+                for context, counts
+                in self.language.trigrams.items()
+            ],
+            "rl_policy": self.policy.export()
+        }
+
+        with open(
+            filename,
+            "w",
+            encoding="utf-8"
+        ) as file:
+            json.dump(
+                data,
+                file,
+                ensure_ascii=False
+            )
+
+        print("[RUBBER] Model saved.")
+
+    def load_model(self, filename):
+        with open(
+            filename,
+            "r",
+            encoding="utf-8"
+        ) as file:
+            data = json.load(file)
+
+        self.dataset = data["dataset"]
+        self.dataset_hash = data.get(
+            "dataset_hash",
+            ""
+        )
+
+        self.space = RubberSpace(
+            SETTINGS["space_bits"]
+        )
+
+        self.spatial_dataset = (
+            self.space.encode_dataset(
+                self.dataset
+            )
+        )
+
+        self.language = RubberTrigrams()
+
+        self.language.unigrams = Counter(
+            data["unigrams"]
+        )
+
+        self.language.vocabulary = set(
+            self.language.unigrams
+        )
+
+        for item in data["bigrams"]:
+            self.language.bigrams[
+                item["context"]
+            ] = Counter(item["counts"])
+
+        for item in data["trigrams"]:
+            self.language.trigrams[
+                tuple(item["context"])
+            ] = Counter(item["counts"])
+
+        self.observed_trigrams = (
+            self.language.observed_transitions()
+        )
+
+        self.observed_bigrams = set()
+
+        for source, targets in (
+            self.language.bigrams.items()
+        ):
+            for target in targets:
+                self.observed_bigrams.add(
+                    (source, target)
+                )
+
+        self.policy = RubberRLPolicy()
+        self.policy.import_policy(
+            data.get("rl_policy", {})
+        )
+
+        self.execute_dataset_sequence()
+
+        self.ready = True
+
+        print(
+            "[RUBBER] Model and RL policy restored."
+        )
 
 
-def tokenize_words(text: str) -> list[str]:
-    """Split text into word tokens and punctuation tokens (lowercased)."""
-    return text.lower().split()
+# ============================================================
+# TERMINAL UI
+# ============================================================
+
+def print_help():
+    print("""
+========================================
+     RUBBER AI 3.1
+========================================
+
+DATA filename.txt      Load dataset and train RL
+PROMPT text            Set generation prompt
+GENERATE 100           Generate 100 tokens
+TRAIN 100 24           Run 100 RL episodes of 24 tokens
+STATUS                 Show engine and RL status
+SETTINGS               Show fixed skeleton settings
+SAVE model.json        Save model and RL policy
+LOAD model.json        Restore model and RL policy
+HELP                   Show commands
+EXIT                   Quit
+========================================
+""")
 
 
-def tokenize_trigrams(text: str) -> list[tuple[str, str, str]]:
-    """Return word trigrams from lowercased whitespace-split tokens."""
-    tokens = tokenize_words(text)
-    return list(zip(tokens, tokens[1:], tokens[2:]))
+def interactive():
+    ai = RubberAI()
 
+    print_help()
 
-def detokenize_words(tokens: list[str]) -> str:
-    """Join word and punctuation tokens with clean spacing."""
-    out = []
-    for tok in tokens:
-        if tok in {"<pad>", "<unk>"}:
-            continue
-        if out and re.match(r"^[^\w\s]+$", tok):
-            out[-1] = out[-1] + tok
-        elif out:
-            out.append(" " + tok)
-        else:
-            out.append(tok)
-    return "".join(out)
-
-
-# --- Quick smoke test on sample text ---
-if __name__ == "__main__":
-    with open(input("Filename: "), "r", encoding="utf-8") as file:
-        corpus = file.read()
-
-    words = tokenize_words(corpus)
-    special_tokens = ["<pad>", "<unk>"]
-    vocab = special_tokens + words
-    stoi = {w: i for i, w in enumerate(vocab)}
-    itos = {i: w for i, w in enumerate(vocab)}
-    pad_id = stoi["<pad>"]
-    unk_id = stoi["<unk>"]
-
-    data = torch.tensor([stoi.get(w, unk_id) for w in words], dtype=torch.long)
-    ngram_size = 17
-    seq_len = min(24, max(1, len(data) - 1))
-    batch_size = 8
-
-    model = NGramReservoirLLM(
-        vocab_size=len(vocab),
-        pad_id=pad_id,
-        n=ngram_size,
-        num_cells=16,
-        hidden_dim=64,
-        num_geom_replicas=4,
-    )
-    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-3)
-    criterion = nn.CrossEntropyLoss()
-
-    for step_idx in range(150):
-        ix = torch.randint(0, len(data) - seq_len - 1, (batch_size,))
-        x = torch.stack([data[i : i + seq_len] for i in ix])
-        y = torch.stack([data[i + 1 : i + 1 + seq_len] for i in ix])
-
-        optimizer.zero_grad()
-        logits = model(x)
-        loss = criterion(logits.view(-1, len(vocab)), y.view(-1))
-        loss.backward()
-        optimizer.step()
-
-        if (step_idx + 1) % 30 == 0:
-            print(f"Step {step_idx + 1:3d} | Loss: {loss.item():.4f}")
     while True:
-        prompt_words = tokenize_words(input("USER: "))
-        prompt_ids = [stoi.get(w, unk_id) for w in prompt_words]
-        generated_ids = model.generate(prompt_ids, max_new_tokens=80)
-        print("Generated:", detokenize_words([itos[i] for i in list(reversed(generated_ids))]))
+        try:
+            line = input("\nRUBBER> ").strip()
+
+            if not line:
+                continue
+
+            parts = shlex.split(line)
+            command = parts[0].upper()
+            args = parts[1:]
+
+            if command == "EXIT":
+                break
+
+            elif command == "HELP":
+                print_help()
+
+            elif command == "DATA":
+                if not args:
+                    print("Usage: DATA filename.txt")
+                    continue
+
+                ai.load_dataset(args[0])
+
+            elif command == "PROMPT":
+                if not args:
+                    print("Usage: PROMPT your prompt text")
+                    continue
+
+                ai.set_prompt(" ".join(args))
+
+            elif command == "GENERATE":
+                length = (
+                    int(args[0]) if args else 100
+                )
+
+                print(
+                    "\n" + ai.generate(length) + "\n"
+                )
+
+            elif command == "TRAIN":
+                episodes = (
+                    int(args[0]) if args else 100
+                )
+
+                length = (
+                    int(args[1])
+                    if len(args) > 1
+                    else SETTINGS["rl_length"]
+                )
+
+                ai.train_policy(episodes, length)
+
+            elif command == "STATUS":
+                print(
+                    json.dumps(
+                        ai.status(),
+                        indent=2
+                    )
+                )
+
+            elif command == "SETTINGS":
+                print(
+                    json.dumps(
+                        SETTINGS,
+                        indent=2
+                    )
+                )
+
+            elif command == "SAVE":
+                if not args:
+                    print("Usage: SAVE model.json")
+                    continue
+
+                ai.save(args[0])
+
+            elif command == "LOAD":
+                if not args:
+                    print("Usage: LOAD model.json")
+                    continue
+
+                ai.load_model(args[0])
+
+            else:
+                print("Unknown command.")
+
+        except Exception as error:
+            print("[ERROR]", error)
+
+
+if __name__ == "__main__":
+    interactive()
