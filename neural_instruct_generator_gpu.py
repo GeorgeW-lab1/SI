@@ -121,7 +121,7 @@ def iter_rows(source, config, split, seed):
                 print(f"Split '{split}' not found; using all splits instead.")
         elif "train" in names:
             names = ["train"]
-        print(f"Streaming splits: {names}")
+        print(f"Downloading streaming splits: {names}")
         parts = [load_dataset(source, config, split=n, streaming=True)
                  .shuffle(seed=seed, buffer_size=5_000) for n in names]
         # Interleave so a 2 GB budget samples every split (e.g. every task category)
