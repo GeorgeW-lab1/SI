@@ -88,7 +88,7 @@ def _s(v):
     return v.strip() if isinstance(v, str) else ""
 
 
-def _iter_rows(source, split, seed):
+def _iter_rows(source, split, seed, config=None, shuffle=True):
     if source.endswith(".jsonl"):
         with open(source, "r", encoding="utf-8") as f:
             for line in f:
@@ -102,20 +102,48 @@ def _iter_rows(source, split, seed):
         yield from rows
     else:
         from datasets import load_dataset  # lazy: local use needs no extra deps
-        ds = load_dataset(source, split=split, streaming=True)
-        yield from ds.shuffle(seed=seed, buffer_size=10_000)
+        ds = load_dataset(source, config, split=split, streaming=True)
+        yield from (ds.shuffle(seed=seed, buffer_size=10_000) if shuffle else ds)
+
+
+def _chat_pairs(rows, text_col, group_col, max_bytes, max_examples, stats):
+    """Chat logs -> (message, reply) pairs: every message is the 'instruction' for the next
+    message in the same room/thread (rows must be stored in conversation order)."""
+    prev_text = prev_group = None
+    used = n = 0
+    for r in rows:
+        text = _s(r.get(text_col))
+        if not text:
+            continue
+        group = r.get(group_col) if group_col else None
+        if prev_text is not None and group == prev_group:
+            used += len(prev_text) + len(text)
+            n += 1
+            if stats is not None:
+                stats["bytes"], stats["examples"] = used, n
+            yield prev_text, text
+            if used >= max_bytes or (max_examples and n >= max_examples):
+                return
+        prev_text, prev_group = text, group
 
 
 def stream_pairs(source, split="train", max_bytes=2_000_000_000, max_examples=None,
-                 seed=0, columns=None, stats=None):
-    """Yield (instruction_text, response_text) until ~max_bytes of text were produced."""
-    rows = _iter_rows(source, split, seed)
+                 seed=0, columns=None, stats=None, config=None, chat=None):
+    """Yield (instruction_text, response_text) until ~max_bytes of text were produced.
+
+    chat=(text_col, group_col) switches to chat-log mode (consecutive messages of a group)."""
+    if chat:
+        print(f"Chat mode: text={chat[0]}, group={chat[1]} (no shuffling, order matters).")
+        yield from _chat_pairs(_iter_rows(source, split, seed, config, shuffle=False),
+                               chat[0], chat[1], max_bytes, max_examples, stats)
+        return
+    rows = _iter_rows(source, split, seed, config)
     first = next(rows, None)
     if first is None:
         raise ValueError("Dataset is empty.")
     keys = set(first.keys())
     if columns:
-        c_inst, c_ctx, c_resp = columns
+        c_inst, c_ctx, c_resp = (None if c in (None, "-", "") else c for c in columns)
     else:
         c_inst = _pick(keys, COLUMN_CANDIDATES["instruction"])
         c_ctx = _pick(keys, COLUMN_CANDIDATES["context"])
@@ -139,6 +167,21 @@ def stream_pairs(source, split="train", max_bytes=2_000_000_000, max_examples=No
         yield text, resp
         if used >= max_bytes or (max_examples and n >= max_examples):
             return
+
+
+def inspect_dataset(source, split="train", config=None, n=3):
+    """Print configs, columns and the first rows so you can pick --columns / --chat-*."""
+    if not source.endswith((".json", ".jsonl")):
+        try:
+            from datasets import get_dataset_config_names
+            print("Configs:", get_dataset_config_names(source))
+        except Exception as e:
+            print("(could not list configs:", e, ")")
+    for k, r in enumerate(islice(_iter_rows(source, split, 0, config, shuffle=False), n)):
+        print(f"--- row {k} ---")
+        for key, v in r.items():
+            v = str(v).replace("\n", " ")
+            print(f"  {key}: {v[:150]}{'...' if len(v) > 150 else ''}")
 
 
 # --------------------------------------------------------- corpus build / read
@@ -166,11 +209,14 @@ def _encode_chunk(pairs):
 
 
 def build_corpus(source, cache_dir, split="train", max_bytes=2_000_000_000,
-                 max_examples=None, max_vocab=80000, max_inst=32, max_resp=128,
-                 vocab_examples=100_000_000, workers=1, seed=0, columns=None, chunk=2000):
+                 max_examples=None, max_vocab=8000, max_inst=32, max_resp=128,
+                 vocab_examples=100_000, workers=1, seed=0, columns=None, chunk=2000,
+                 config=None, chat=None):
+    assert max_vocab <= 65535, "token ids are stored as uint16"
     os.makedirs(cache_dir, exist_ok=True)
     stats = {"bytes": 0, "examples": 0}
-    it = stream_pairs(source, split, max_bytes, max_examples, seed, columns, stats)
+    it = stream_pairs(source, split, max_bytes, max_examples, seed, columns, stats,
+                      config, chat)
     t0 = time.time()
 
     # 1) buffer the first rows (raw text only) to build the vocabulary
@@ -323,7 +369,7 @@ class Prefetcher:
 class InstructGenerator:
     PARAM_KEYS = ["E", "C", "W1", "b1", "W2", "b2"]
 
-    def __init__(self, context=3, embed_dim=48, hidden=192, max_vocab=80000,
+    def __init__(self, context=3, embed_dim=48, hidden=192, max_vocab=8000,
                  max_inst=32, max_resp=128, seed=0, device=None):
         self.N = context
         self.d = embed_dim
@@ -709,30 +755,40 @@ def main():
     ap.add_argument("--dataset", default="alphaXiv/AgentAlphaXiv",
                     help="HF dataset id or local .jsonl file (.json loads fully into RAM)")
     ap.add_argument("--split", default="train")
+    ap.add_argument("--config", default=None, help="HF dataset config / subset name")
+    ap.add_argument("--columns", nargs=3, metavar=("INST", "CTX", "RESP"),
+                    default=["title", "-", "abstract"],
+                    help="column names; use - for no context column")
+    ap.add_argument("--chat-text", default=None,
+                    help="chat-log mode: column with the message text (pairs consecutive messages)")
+    ap.add_argument("--chat-group", default=None,
+                    help="chat-log mode: column identifying the room/thread")
+    ap.add_argument("--inspect", action="store_true",
+                    help="print the dataset's configs, columns and first rows, then exit")
     ap.add_argument("--max-bytes", type=float, default=2e9,
                     help="approx. characters of text to ingest (default 2e9 = ~2 GB)")
     ap.add_argument("--max-examples", type=int, default=None)
-    ap.add_argument("--cache-dir", default="corpus_cache", help="encoded corpus location")
+    ap.add_argument("--cache-dir", default="agentalphaxiv_cache", help="encoded corpus location")
     ap.add_argument("--rebuild", action="store_true", help="re-tokenize even if a cache exists")
     ap.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) - 1))
-    ap.add_argument("--vocab-examples", type=int, default=100_000_000)
-    ap.add_argument("--max-vocab", type=int, default=80000)
+    ap.add_argument("--vocab-examples", type=int, default=100_000)
+    ap.add_argument("--max-vocab", type=int, default=8000)
     ap.add_argument("--max-inst", type=int, default=32, help="instruction tokens kept")
-    ap.add_argument("--max-resp", type=int, default=128, help="response tokens kept")
-    ap.add_argument("--epochs", "--passes", dest="passes", type=float, default=1.0,
+    ap.add_argument("--max-resp", type=int, default=256, help="response tokens kept")
+    ap.add_argument("--epochs", "--passes", dest="passes", type=float, default=5.0,
                     help="passes over the corpus's target tokens (fractions allowed)")
     ap.add_argument("--max-minutes", type=float, default=None, help="wall-clock training cap")
-    ap.add_argument("--batch", type=int, default=512)
+    ap.add_argument("--batch", type=int, default=4096)
     ap.add_argument("--lr", type=float, default=3e-3)
-    ap.add_argument("--context", type=int, default=3)
-    ap.add_argument("--save", default=None, help="save trained model to this .npz")
+    ap.add_argument("--context", type=int, default=4)
+    ap.add_argument("--save", default="agentalphaxiv.npz", help="save trained model to this .npz")
     ap.add_argument("--checkpoint-every", type=int, default=20000, help="steps (needs --save)")
     ap.add_argument("--load", default=None, help="load a saved .npz instead of training")
-    ap.add_argument("--tolerance", type=int, default=2,
+    ap.add_argument("--tolerance", type=int, default=1,
                     help="inconsistency score (repeats) that makes a text 'paradoxical'; "
                          "1 = most sensitive")
-    ap.add_argument("--temperature", type=float, default=0.1)
-    ap.add_argument("--top-k", type=int, default=64)
+    ap.add_argument("--temperature", type=float, default=0.8)
+    ap.add_argument("--top-k", type=int, default=140)
     ap.add_argument("--device", default=None, help="cuda, cuda:1, cpu (default: cuda if available)")
     ap.add_argument("--tf32", action="store_true",
                     help="allow TF32 tensor-core matmuls (faster on Ampere+, slightly lower precision)")
@@ -747,6 +803,10 @@ def main():
         torch.backends.cudnn.allow_tf32 = args.tf32
         print(f"Using GPU: {torch.cuda.get_device_name(device)}")
 
+    if args.inspect:
+        inspect_dataset(args.dataset, args.split, args.config)
+        return
+
     if args.load:
         model = InstructGenerator.load(args.load, device=device)
         print(f"Loaded model from {args.load} (vocab {len(model.vocab)}).")
@@ -755,7 +815,10 @@ def main():
         if args.rebuild or not os.path.exists(meta_path):
             build_corpus(args.dataset, args.cache_dir, args.split, int(args.max_bytes),
                          args.max_examples, args.max_vocab, args.max_inst, args.max_resp,
-                         args.vocab_examples, args.workers)
+                         args.vocab_examples, args.workers,
+                         columns=tuple(args.columns) if args.columns else None,
+                         config=args.config,
+                         chat=(args.chat_text, args.chat_group) if args.chat_text else None)
         else:
             print(f"Reusing encoded corpus in {args.cache_dir}/ (use --rebuild to redo).")
         corpus = Corpus(args.cache_dir)
@@ -782,8 +845,8 @@ def main():
         if not instruction:
             continue
         try:
-            length = 3
-            rounds = 1000
+            length = int(input("Max tokens per pass: "))
+            rounds = int(input("Deconstruction/regeneration rounds (0 = off): "))
             text, trace = model.generate(instruction, length, rounds,
                                          temperature=args.temperature, top_k=args.top_k,
                                          tolerance=args.tolerance, return_trace=True)
