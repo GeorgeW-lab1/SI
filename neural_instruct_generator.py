@@ -29,7 +29,7 @@ Generation follows a modal constructor / deconstructor loop:
 
 Usage:
   pip install datasets numpy
-  python neural_instruct_generator.py --dataset tatsu-lab/alpaca --max-bytes 2e9 \
+  python neural_instruct_generator.py --dataset Open-Orca/OpenOrca --max-bytes 2e9 \
          --save model.npz --max-minutes 120
   python neural_instruct_generator.py --dataset my_data.jsonl --max-bytes 2e9
   python neural_instruct_generator.py --load model.npz
@@ -462,11 +462,26 @@ class InstructGenerator:
         """Collapse repeats/loops in text (kept for API compatibility)."""
         return self.detokenize(self._collapse(TOKEN_RE.findall(text)))
 
-    def _inconsistency(self, tokens):
-        """Evaluate: how many tokens of this prefix are self-repeats (loop residue)."""
-        return len(tokens) - len(self._collapse(tokens))
+    @staticmethod
+    def _repeat_ngrams(tokens, n=3):
+        """Positions whose n-gram already appeared earlier (catches non-adjacent loops)."""
+        low = [t.lower() for t in tokens]
+        seen, rep = set(), 0
+        for i in range(n - 1, len(low)):
+            g = tuple(low[i - n + 1:i + 1])
+            if g in seen:
+                rep += 1
+            else:
+                seen.add(g)
+        return rep
 
-    def liar_shift(self, tokens, tolerance=3):
+    def _inconsistency(self, tokens):
+        """Evaluate: self-repetition in this prefix = adjacent repeats/loops that
+        deconstruct would delete + repeated trigrams anywhere earlier in the text.
+        Both counts only grow as tokens are added, so truth is a step in the index."""
+        return (len(tokens) - len(self._collapse(tokens))) + self._repeat_ngrams(tokens)
+
+    def liar_shift(self, tokens, tolerance=2):
         """Index n of the first paradoxical prefix tokens[:n] (None if there is none).
 
         Truth value T(n) = "inconsistency of tokens[:n] < tolerance" is a step function
@@ -531,12 +546,12 @@ class InstructGenerator:
         return out
 
     def generate(self, instruction, length=64, deconstruction_rounds=1,
-                 temperature=0.8, top_k=40, tolerance=3, return_trace=False):
+                 temperature=0.8, top_k=40, tolerance=2, return_trace=False):
         """Modal constructor / deconstructor loop.
 
         Construct : add up to `length` tokens (M).
         Evaluate  : exponential search for the liar shift - the index where the text
-                    turns paradoxical (>= `tolerance` self-repeating tokens).
+                    turns paradoxical (inconsistency score >= `tolerance`).
         Deconstruct: reset to the last consistent state (just before the shift) and
                     collapse remaining repeats (D), replacing the text.
         The trace holds the damage metrics of every round.
@@ -562,7 +577,8 @@ class InstructGenerator:
             trace.append(dict(
                 round=r + 1,
                 liar_shift=shift,
-                logical_collapse=(before - len(self._collapse(resp))) / max(before, 1),
+                length=before,
+                logical_collapse=min(1.0, self._inconsistency(resp) / max(before, 1)),
                 information_loss=(before - len(reduced)) / max(before, 1),
                 cognitive_overload=self._surprisal(inst_row, self._encode(resp)),
             ))
@@ -575,7 +591,7 @@ class InstructGenerator:
 # ------------------------------------------------------------------------ CLI
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--dataset", default="tatsu-lab/alpaca",
+    ap.add_argument("--dataset", default="Open-Orca/OpenOrca",
                     help="HF dataset id or local .jsonl file (.json loads fully into RAM)")
     ap.add_argument("--split", default="train")
     ap.add_argument("--max-bytes", type=float, default=2e9,
@@ -597,8 +613,11 @@ def main():
     ap.add_argument("--save", default=None, help="save trained model to this .npz")
     ap.add_argument("--checkpoint-every", type=int, default=20000, help="steps (needs --save)")
     ap.add_argument("--load", default=None, help="load a saved .npz instead of training")
-    ap.add_argument("--tolerance", type=int, default=3,
-                    help="self-repeating tokens that make a text 'paradoxical' (liar shift)")
+    ap.add_argument("--tolerance", type=int, default=2,
+                    help="inconsistency score (repeats) that makes a text 'paradoxical'; "
+                         "1 = most sensitive")
+    ap.add_argument("--temperature", type=float, default=0.8)
+    ap.add_argument("--top-k", type=int, default=40)
     ap.add_argument("--train-only", action="store_true", help="skip the interactive prompt")
     args = ap.parse_args()
 
@@ -636,10 +655,9 @@ def main():
             length = int(input("Max tokens per pass: "))
             rounds = int(input("Deconstruction/regeneration rounds (0 = off): "))
             text, trace = model.generate(instruction, length, rounds,
+                                         temperature=args.temperature, top_k=args.top_k,
                                          tolerance=args.tolerance, return_trace=True)
             print("\n" + text)
-            for t in trace:
-                shift = "none" if t["liar_shift"] is None else f"token {t['liar_shift']}"
         except ValueError as e:
             print("Invalid input:", e)
         except KeyboardInterrupt:
