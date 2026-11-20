@@ -88,6 +88,20 @@ def _s(v):
     return v.strip() if isinstance(v, str) else ""
 
 
+def _round_robin(iterators):
+    """Interleave several iterators so a byte cap samples every one of them evenly."""
+    live = [iter(i) for i in iterators]
+    while live:
+        nxt = []
+        for it in live:
+            try:
+                yield next(it)
+                nxt.append(it)
+            except StopIteration:
+                pass
+        live = nxt
+
+
 def _iter_rows(source, split, seed, config=None, shuffle=True):
     if source.endswith(".jsonl"):
         with open(source, "r", encoding="utf-8") as f:
@@ -101,9 +115,18 @@ def _iter_rows(source, split, seed, config=None, shuffle=True):
         random.Random(seed).shuffle(rows)
         yield from rows
     else:
-        from datasets import load_dataset  # lazy: local use needs no extra deps
-        ds = load_dataset(source, config, split=split, streaming=True)
-        yield from (ds.shuffle(seed=seed, buffer_size=10_000) if shuffle else ds)
+        from datasets import load_dataset, get_dataset_split_names  # lazy: local use needs no extra deps
+        if split in ("all", "*"):
+            names = get_dataset_split_names(source, config)
+            print(f"Using all {len(names)} splits: {names}")
+            streams = []
+            for name in names:
+                ds = load_dataset(source, config, split=name, streaming=True)
+                streams.append(ds.shuffle(seed=seed, buffer_size=10_000) if shuffle else ds)
+            yield from _round_robin(streams)
+        else:
+            ds = load_dataset(source, config, split=split, streaming=True)
+            yield from (ds.shuffle(seed=seed, buffer_size=10_000) if shuffle else ds)
 
 
 def _chat_pairs(rows, text_col, group_col, max_bytes, max_examples, stats):
@@ -127,6 +150,28 @@ def _chat_pairs(rows, text_col, group_col, max_bytes, max_examples, stats):
         prev_text, prev_group = text, group
 
 
+def _message_pairs(r, col="messages"):
+    """Yield (user_text, assistant_text) for every user->assistant turn of a chat-format row."""
+    msgs = r.get(col)
+    if isinstance(msgs, str):
+        try:
+            msgs = json.loads(msgs)
+        except ValueError:
+            return
+    if not isinstance(msgs, list):
+        return
+    prev_user = None
+    for m in msgs:
+        if not isinstance(m, dict):
+            continue
+        role, text = m.get("role"), _s(m.get("content"))
+        if role == "user":
+            prev_user = text
+        elif role == "assistant" and prev_user and text:
+            yield prev_user, text
+            prev_user = None
+
+
 def stream_pairs(source, split="train", max_bytes=2_000_000_000, max_examples=None,
                  seed=0, columns=None, stats=None, config=None, chat=None):
     """Yield (instruction_text, response_text) until ~max_bytes of text were produced.
@@ -142,31 +187,38 @@ def stream_pairs(source, split="train", max_bytes=2_000_000_000, max_examples=No
     if first is None:
         raise ValueError("Dataset is empty.")
     keys = set(first.keys())
-    if columns:
-        c_inst, c_ctx, c_resp = (None if c in (None, "-", "") else c for c in columns)
+    msg_col = "messages" if (not columns and "messages" in keys) else None
+    if msg_col:
+        print("Detected chat-format rows: using every user->assistant turn in 'messages'.")
+        pairs_of = lambda r: _message_pairs(r, msg_col)
     else:
-        c_inst = _pick(keys, COLUMN_CANDIDATES["instruction"])
-        c_ctx = _pick(keys, COLUMN_CANDIDATES["context"])
-        c_resp = _pick(keys, COLUMN_CANDIDATES["response"])
-    if not c_inst or not c_resp:
-        raise ValueError(f"Couldn't detect columns in {sorted(keys)}; pass columns=(...).")
-    print(f"Columns: instruction={c_inst}, context={c_ctx}, response={c_resp}")
+        if columns:
+            c_inst, c_ctx, c_resp = (None if c in (None, "-", "") else c for c in columns)
+        else:
+            c_inst = _pick(keys, COLUMN_CANDIDATES["instruction"])
+            c_ctx = _pick(keys, COLUMN_CANDIDATES["context"])
+            c_resp = _pick(keys, COLUMN_CANDIDATES["response"])
+        if not c_inst or not c_resp:
+            raise ValueError(f"Couldn't detect columns in {sorted(keys)}; pass columns=(...).")
+        print(f"Columns: instruction={c_inst}, context={c_ctx}, response={c_resp}")
+
+        def pairs_of(r):
+            inst = _s(r.get(c_inst))
+            ctx = _s(r.get(c_ctx)) if c_ctx else ""
+            resp = _s(r.get(c_resp))
+            if inst and resp:
+                yield f"{inst} {ctx}".strip(), resp
 
     used = n = 0
     for r in chain([first], rows):
-        inst = _s(r.get(c_inst))
-        ctx = _s(r.get(c_ctx)) if c_ctx else ""
-        resp = _s(r.get(c_resp))
-        if not inst or not resp:
-            continue
-        text = f"{inst} {ctx}".strip()
-        used += len(text) + len(resp)
-        n += 1
-        if stats is not None:
-            stats["bytes"], stats["examples"] = used, n
-        yield text, resp
-        if used >= max_bytes or (max_examples and n >= max_examples):
-            return
+        for text, resp in pairs_of(r):
+            used += len(text) + len(resp)
+            n += 1
+            if stats is not None:
+                stats["bytes"], stats["examples"] = used, n
+            yield text, resp
+            if used >= max_bytes or (max_examples and n >= max_examples):
+                return
 
 
 def inspect_dataset(source, split="train", config=None, n=3):
@@ -754,11 +806,13 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dataset", default="microsoft/orca-agentinstruct-1M-v1",
                     help="HF dataset id or local .jsonl file (.json loads fully into RAM)")
-    ap.add_argument("--split", default="train")
+    ap.add_argument("--split", default="all",
+                    help="split name, or 'all' to interleave every split of the dataset")
     ap.add_argument("--config", default=None, help="HF dataset config / subset name")
     ap.add_argument("--columns", nargs=3, metavar=("INST", "CTX", "RESP"),
-                    default=["title", "-", "abstract"],
-                    help="column names; use - for no context column")
+                    default=None,
+                    help="column names (default: auto-detect, incl. chat-format 'messages'); "
+                         "use - for no context column")
     ap.add_argument("--chat-text", default=None,
                     help="chat-log mode: column with the message text (pairs consecutive messages)")
     ap.add_argument("--chat-group", default=None,
@@ -845,8 +899,8 @@ def main():
         if not instruction:
             continue
         try:
-            length = int(input("Max tokens per pass: "))
-            rounds = int(input("Deconstruction/regeneration rounds (0 = off): "))
+            length = 3
+            rounds = 200
             text, trace = model.generate(instruction, length, rounds,
                                          temperature=args.temperature, top_k=args.top_k,
                                          tolerance=args.tolerance, return_trace=True)
