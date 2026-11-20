@@ -963,7 +963,7 @@ def agent_repl(model, args):
 # ------------------------------------------------------------------------ CLI
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--dataset", default="ise-uiuc/Magicoder-OSS-Instruct-75K",
+    ap.add_argument("--dataset", default="tatsu-lab/alpaca",
                     help="HF dataset id or local .jsonl file (.json loads fully into RAM)")
     ap.add_argument("--split", default="train")
     ap.add_argument("--config", default=None, help="HF dataset config / subset name")
