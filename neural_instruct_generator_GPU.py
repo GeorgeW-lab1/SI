@@ -783,7 +783,7 @@ def main():
             continue
         try:
             length = 3
-            rounds = 100
+            rounds = 1000
             text, trace = model.generate(instruction, length, rounds,
                                          temperature=args.temperature, top_k=args.top_k,
                                          tolerance=args.tolerance, return_trace=True)
