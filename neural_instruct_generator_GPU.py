@@ -782,8 +782,8 @@ def main():
         if not instruction:
             continue
         try:
-            length = int(input("Max tokens per pass: "))
-            rounds = int(input("Deconstruction/regeneration rounds (0 = off): "))
+            length = 3
+            rounds = 100
             text, trace = model.generate(instruction, length, rounds,
                                          temperature=args.temperature, top_k=args.top_k,
                                          tolerance=args.tolerance, return_trace=True)
