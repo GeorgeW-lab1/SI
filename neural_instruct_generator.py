@@ -591,7 +591,7 @@ class InstructGenerator:
 # ------------------------------------------------------------------------ CLI
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--dataset", default="Open-Orca/OpenOrca",
+    ap.add_argument("--dataset", default="tatsu-lab/alpaca",
                     help="HF dataset id or local .jsonl file (.json loads fully into RAM)")
     ap.add_argument("--split", default="train")
     ap.add_argument("--max-bytes", type=float, default=2e9,
