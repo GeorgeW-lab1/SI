@@ -815,9 +815,9 @@ class InstructGenerator:
 # ------------------------------------------------------------------------ CLI
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--dataset", default="microsoft/orca-agentinstruct-1M-v1",
+    ap.add_argument("--dataset", default="yahma/alpaca-cleaned",
                     help="HF dataset id or local .jsonl file (.json loads fully into RAM)")
-    ap.add_argument("--split", default="all",
+    ap.add_argument("--split", default="train",
                     help="split name, or 'all' to interleave every split of the dataset")
     ap.add_argument("--config", default=None, help="HF dataset config / subset name")
     ap.add_argument("--columns", nargs=3, metavar=("INST", "CTX", "RESP"),
@@ -831,7 +831,7 @@ def main():
     ap.add_argument("--inspect", action="store_true",
                     help="print the dataset's configs, columns and first rows, then exit")
     ap.add_argument("--max-bytes", type=float, default=2e9,
-                    help="approx. characters of text to ingest (default 2e9 = ~2 GB)")
+                    help="approx. characters of text to ingest (default 2e9 = ~2 GB cap)")
     ap.add_argument("--max-examples", type=int, default=None)
     ap.add_argument("--cache-dir", default="agentalphaxiv_cache", help="encoded corpus location")
     ap.add_argument("--rebuild", action="store_true", help="re-tokenize even if a cache exists")
