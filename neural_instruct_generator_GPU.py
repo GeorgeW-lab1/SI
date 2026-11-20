@@ -88,18 +88,29 @@ def _s(v):
     return v.strip() if isinstance(v, str) else ""
 
 
-def _round_robin(iterators):
-    """Interleave several iterators so a byte cap samples every one of them evenly."""
-    live = [iter(i) for i in iterators]
+def _round_robin(iterators, names=None):
+    """Interleave several iterators so a byte cap samples every one of them evenly.
+
+    A stream that dies (e.g. a network reset that exhausted its retries) is dropped with a
+    warning and the others carry on; only if every stream fails is the error re-raised."""
+    live = [(k, iter(i)) for k, i in enumerate(iterators)]
+    last_err, yielded = None, False
     while live:
         nxt = []
-        for it in live:
+        for k, it in live:
             try:
                 yield next(it)
-                nxt.append(it)
+                yielded = True
+                nxt.append((k, it))
             except StopIteration:
                 pass
+            except Exception as e:  # noqa: BLE001 - network / parquet errors
+                label = names[k] if names else k
+                print(f"Warning: dropping split '{label}' after error: {e}")
+                last_err = e
         live = nxt
+    if last_err is not None and not yielded:
+        raise last_err
 
 
 def _iter_rows(source, split, seed, config=None, shuffle=True):
@@ -123,7 +134,7 @@ def _iter_rows(source, split, seed, config=None, shuffle=True):
             for name in names:
                 ds = load_dataset(source, config, split=name, streaming=True)
                 streams.append(ds.shuffle(seed=seed, buffer_size=10_000) if shuffle else ds)
-            yield from _round_robin(streams)
+            yield from _round_robin(streams, names)
         else:
             ds = load_dataset(source, config, split=split, streaming=True)
             yield from (ds.shuffle(seed=seed, buffer_size=10_000) if shuffle else ds)
@@ -899,8 +910,8 @@ def main():
         if not instruction:
             continue
         try:
-            length = 3
-            rounds = 200
+            length = int(input("Max tokens per pass: "))
+            rounds = int(input("Deconstruction/regeneration rounds (0 = off): "))
             text, trace = model.generate(instruction, length, rounds,
                                          temperature=args.temperature, top_k=args.top_k,
                                          tolerance=args.tolerance, return_trace=True)
