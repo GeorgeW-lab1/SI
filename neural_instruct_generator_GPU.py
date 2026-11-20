@@ -166,9 +166,8 @@ def _encode_chunk(pairs):
 
 
 def build_corpus(source, cache_dir, split="train", max_bytes=2_000_000_000,
-                 max_examples=None, max_vocab=8000, max_inst=32, max_resp=128,
-                 vocab_examples=100_000, workers=1, seed=0, columns=None, chunk=2000):
-    assert max_vocab <= 65535, "token ids are stored as uint16"
+                 max_examples=None, max_vocab=80000, max_inst=32, max_resp=128,
+                 vocab_examples=100_000_000, workers=1, seed=0, columns=None, chunk=2000):
     os.makedirs(cache_dir, exist_ok=True)
     stats = {"bytes": 0, "examples": 0}
     it = stream_pairs(source, split, max_bytes, max_examples, seed, columns, stats)
@@ -324,7 +323,7 @@ class Prefetcher:
 class InstructGenerator:
     PARAM_KEYS = ["E", "C", "W1", "b1", "W2", "b2"]
 
-    def __init__(self, context=3, embed_dim=48, hidden=192, max_vocab=8000,
+    def __init__(self, context=3, embed_dim=48, hidden=192, max_vocab=80000,
                  max_inst=32, max_resp=128, seed=0, device=None):
         self.N = context
         self.d = embed_dim
@@ -716,8 +715,8 @@ def main():
     ap.add_argument("--cache-dir", default="corpus_cache", help="encoded corpus location")
     ap.add_argument("--rebuild", action="store_true", help="re-tokenize even if a cache exists")
     ap.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) - 1))
-    ap.add_argument("--vocab-examples", type=int, default=100_000)
-    ap.add_argument("--max-vocab", type=int, default=8000)
+    ap.add_argument("--vocab-examples", type=int, default=100_000_000)
+    ap.add_argument("--max-vocab", type=int, default=80000)
     ap.add_argument("--max-inst", type=int, default=32, help="instruction tokens kept")
     ap.add_argument("--max-resp", type=int, default=128, help="response tokens kept")
     ap.add_argument("--epochs", "--passes", dest="passes", type=float, default=1.0,
