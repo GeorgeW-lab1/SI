@@ -781,7 +781,7 @@ def main():
     ap.add_argument("--batch", type=int, default=4096)
     ap.add_argument("--lr", type=float, default=3e-3)
     ap.add_argument("--context", type=int, default=4)
-    ap.add_argument("--save", default="agentalphaxiv.npz", help="save trained model to this .npz")
+    ap.add_argument("--save", default="test.npz", help="save trained model to this .npz")
     ap.add_argument("--checkpoint-every", type=int, default=20000, help="steps (needs --save)")
     ap.add_argument("--load", default=None, help="load a saved .npz instead of training")
     ap.add_argument("--tolerance", type=int, default=1,
