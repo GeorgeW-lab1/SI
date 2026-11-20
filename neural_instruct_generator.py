@@ -178,7 +178,7 @@ def build_corpus(source, cache_dir, split="train", max_bytes=2_000_000_000,
     # 2) encode everything (buffer first, then the rest of the stream) in parallel
     inst_f = open(os.path.join(cache_dir, "inst.u16"), "wb")
     resp_f = open(os.path.join(cache_dir, "resp.u16"), "wb")
-    all_lens, n_tok = [], 0
+    all_lens, n_tok, n_done = [], 0, 0
 
     def chunks():
         src = chain(buf, it)
@@ -189,13 +189,14 @@ def build_corpus(source, cache_dir, split="train", max_bytes=2_000_000_000,
             yield c
 
     def write(result):
-        nonlocal n_tok
+        nonlocal n_tok, n_done
         inst, flat, lens = result
         inst_f.write(inst.tobytes())
         resp_f.write(flat.tobytes())
         all_lens.append(lens)
         n_tok += len(flat)
-        done = sum(len(x) for x in all_lens)
+        n_done += len(lens)
+        done = n_done
         if (done // chunk) % 25 == 0:
             el = time.time() - t0
             print(f"  {done:,} examples, {stats['bytes'] / 1e6:,.0f} MB read, "
@@ -372,7 +373,7 @@ class InstructGenerator:
         ar = np.arange(batch)
         t0 = last_t = time.time()
         run_loss, run_n = 0.0, 0
-        step = 0
+        done_steps = 0
         try:
             for step in range(steps_total):
                 now = time.time()
@@ -390,6 +391,7 @@ class InstructGenerator:
                 probs = self._softmax(logits)
                 loss = float(-np.log(probs[ar, y] + 1e-9).mean())
                 self._adam(self._backward(probs, y, cache), cur_lr)
+                done_steps += 1
                 run_loss += loss
                 run_n += 1
 
@@ -406,13 +408,16 @@ class InstructGenerator:
                     self.save(save_path)
         except KeyboardInterrupt:
             print("\nInterrupted - keeping the current weights.")
-        print(f"Training finished after {step + 1:,} steps ({(time.time() - t0) / 60:.1f} min).")
+        print(f"Training finished after {done_steps:,} steps ({(time.time() - t0) / 60:.1f} min).")
 
     # -- save / load
     def save(self, path):
+        if not path.endswith(".npz"):
+            path += ".npz"
         cfg = json.dumps(dict(N=self.N, d=self.d, h=self.h, max_vocab=self.max_vocab,
                               max_inst=self.max_inst, max_resp=self.max_resp))
         np.savez_compressed(path, vocab=np.array(self.vocab), cfg=np.array(cfg), **self.params)
+        return path
 
     @classmethod
     def load(cls, path):
@@ -584,6 +589,9 @@ class InstructGenerator:
             ))
             resp = reduced + self._continue(reduced, inst_row, length,    # Construct
                                             temperature, top_k)
+        if deconstruction_rounds:
+            resp = self._collapse(resp)          # final Deconstruct: the last Construct
+                                                 # was never evaluated, so collapse it too
         text = self.detokenize(resp)
         return (text, trace) if return_trace else text
 
@@ -600,7 +608,7 @@ def main():
     ap.add_argument("--cache-dir", default="corpus_cache", help="encoded corpus location")
     ap.add_argument("--rebuild", action="store_true", help="re-tokenize even if a cache exists")
     ap.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) - 1))
-    ap.add_argument("--vocab-examples", type=int, default=100)
+    ap.add_argument("--vocab-examples", type=int, default=100_000)
     ap.add_argument("--max-vocab", type=int, default=8000)
     ap.add_argument("--max-inst", type=int, default=32, help="instruction tokens kept")
     ap.add_argument("--max-resp", type=int, default=128, help="response tokens kept")
@@ -640,8 +648,7 @@ def main():
                            max_seconds=args.max_minutes * 60 if args.max_minutes else None,
                            save_path=args.save, checkpoint_every=args.checkpoint_every)
         if args.save:
-            model.save(args.save)
-            print(f"Saved to {args.save}")
+            print(f"Saved to {model.save(args.save)}")
 
     if args.train_only:
         return
@@ -658,7 +665,6 @@ def main():
                                          temperature=args.temperature, top_k=args.top_k,
                                          tolerance=args.tolerance, return_trace=True)
             print("\n" + text)
-
 
         except ValueError as e:
             print("Invalid input:", e)
