@@ -7,7 +7,16 @@ Model: P(next response token | last N response tokens, bag-of-words of the instr
   mean instruction   ┘
   embedding (own table)
 
-Pure NumPy with manual backprop and Adam. The deconstruct / regenerate loop is kept.
+PyTorch tensors on the GPU, but with the SAME hand-written forward pass, manual backprop
+and manual Adam as the NumPy original (no autograd, no nn.Module, no torch.optim) so every
+bit of the math is unchanged. The deconstruct / regenerate loop is kept.
+
+GPU notes
+  * All parameters, Adam moments, activations and gradients live on the GPU (float32).
+  * The on-disk memmap corpus is still sampled on the CPU, but a background thread
+    prefetches pinned batches and copies them to the GPU asynchronously.
+  * Checkpoints are still .npz, so models trained by the NumPy version load here and vice versa.
+  * --gradcheck compares the manual gradients against torch.autograd as a sanity test.
 
 What changed for large data
   * The dataset is STREAMED (HF streaming=True or line-by-line JSONL) up to --max-bytes
@@ -28,23 +37,26 @@ Generation follows a modal constructor / deconstructor loop:
   (logical collapse, information loss, cognitive overload) for every round.
 
 Usage:
-  pip install datasets numpy
-  python neural_instruct_generator.py --dataset tatsu-lab/alpaca --max-bytes 2e9 \
+  pip install datasets numpy torch
+  python neural_instruct_generator_torch.py --dataset Open-Orca/OpenOrca --max-bytes 2e9 \
          --save model.npz --max-minutes 120
-  python neural_instruct_generator.py --dataset my_data.jsonl --max-bytes 2e9
-  python neural_instruct_generator.py --load model.npz
+  python neural_instruct_generator_torch.py --dataset my_data.jsonl --max-bytes 2e9
+  python neural_instruct_generator_torch.py --load model.npz
 """
 
 import argparse
 import json
 import os
 import random
+import queue
 import re
+import threading
 import time
 from collections import Counter, deque
 from itertools import chain, islice
 
 import numpy as np
+import torch
 
 # Special tokens occupy the first ids.
 SPECIALS = ["<unk>", "<pad>", "<|resp|>", "<|end|>"]
@@ -261,17 +273,70 @@ class Corpus:
         return win, inst, y
 
 
+# ------------------------------------------------------------------ GPU helpers
+def get_device(name=None):
+    if name:
+        dev = torch.device(name)
+        if dev.type == "cuda" and not torch.cuda.is_available():
+            print("Warning: CUDA requested but not available, falling back to CPU.")
+            return torch.device("cpu")
+        return dev
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    print("Warning: no CUDA GPU found, running on CPU.")
+    return torch.device("cpu")
+
+
+class Prefetcher:
+    """Samples batches from the memmap corpus in a background thread and ships them
+    to the GPU (pinned memory + non_blocking copies) so the GPU never waits on disk/NumPy."""
+
+    def __init__(self, corpus, B, N, device, seed=0, depth=6):
+        self.corpus, self.B, self.N, self.device = corpus, B, N, device
+        self.pin = device.type == "cuda"
+        self.rng = np.random.default_rng(seed)
+        self.q = queue.Queue(maxsize=depth)
+        self.stop_evt = threading.Event()
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def _run(self):
+        while not self.stop_evt.is_set():
+            arrays = self.corpus.batch(self.rng, self.B, self.N)
+            ts = [torch.from_numpy(a) for a in arrays]
+            if self.pin:
+                ts = [t.pin_memory() for t in ts]
+            while not self.stop_evt.is_set():
+                try:
+                    self.q.put(ts, timeout=0.1)
+                    break
+                except queue.Full:
+                    continue
+
+    def get(self):
+        return [t.to(self.device, non_blocking=True) for t in self.q.get()]
+
+    def close(self):
+        self.stop_evt.set()
+
+
 # ----------------------------------------------------------------------- model
 class InstructGenerator:
+    PARAM_KEYS = ["E", "C", "W1", "b1", "W2", "b2"]
+
     def __init__(self, context=3, embed_dim=48, hidden=192, max_vocab=8000,
-                 max_inst=32, max_resp=128, seed=0):
+                 max_inst=32, max_resp=128, seed=0, device=None):
         self.N = context
         self.d = embed_dim
         self.h = hidden
         self.max_vocab = max_vocab
         self.max_inst = max_inst
         self.max_resp = max_resp
-        self.rng = np.random.default_rng(seed)
+        self.seed = seed
+        self.device = device if isinstance(device, torch.device) else get_device(device)
+        self.rng = np.random.default_rng(seed)              # init + corpus sampling
+        self.tgen = torch.Generator(device=self.device)     # token sampling on the GPU
+        self.tgen.manual_seed(seed)
         self.vocab = []
         self.stoi = {}
         self.params = None
@@ -283,52 +348,56 @@ class InstructGenerator:
     def _encode(self, tokens):
         return [self.stoi.get(t, UNK) for t in tokens]
 
+    def _to_dev(self, a):
+        return torch.as_tensor(a).to(self.device)
+
     def _init_params(self):
         V, d, h, N = len(self.vocab), self.d, self.h, self.N
         r = self.rng
         in_dim = (N + 1) * d
 
         def nrm(scale, shape):
-            return r.normal(0, scale, shape).astype(np.float32)
+            return self._to_dev(r.normal(0, scale, shape).astype(np.float32))
 
+        dev = self.device
         self.params = {
             "E": nrm(0.1, (V, d)),
             "C": nrm(0.1, (V, d)),
             "W1": nrm(1 / np.sqrt(in_dim), (in_dim, h)),
-            "b1": np.zeros(h, np.float32),
+            "b1": torch.zeros(h, dtype=torch.float32, device=dev),
             "W2": nrm(1 / np.sqrt(h), (h, V)),
-            "b2": np.zeros(V, np.float32),
+            "b2": torch.zeros(V, dtype=torch.float32, device=dev),
         }
-        self._m = {k: np.zeros_like(v) for k, v in self.params.items()}
-        self._v = {k: np.zeros_like(v) for k, v in self.params.items()}
+        self._m = {k: torch.zeros_like(v) for k, v in self.params.items()}
+        self._v = {k: torch.zeros_like(v) for k, v in self.params.items()}
         self._t = 0
 
-    # -- forward / backward
+    # -- forward / backward  (manual math, identical to the NumPy version)
     def _forward(self, ctx, inst):
-        """ctx: (B, N) window ids; inst: (B, L) instruction ids (PAD-padded)."""
+        """ctx: (B, N) window ids; inst: (B, L) instruction ids (PAD-padded). Long tensors on device."""
         p = self.params
-        B = len(ctx)
+        B = ctx.shape[0]
         emb = p["E"][ctx].reshape(B, -1)
-        mask = (inst != PAD).astype(np.float32)
-        cnt = np.maximum(mask.sum(1, keepdims=True), 1.0)
+        mask = (inst != PAD).to(torch.float32)
+        cnt = mask.sum(1, keepdim=True).clamp(min=1.0)
         cond = (p["C"][inst] * mask[:, :, None]).sum(1) / cnt
-        x = np.concatenate([emb, cond], axis=1)
-        a = np.tanh(x @ p["W1"] + p["b1"])
+        x = torch.cat([emb, cond], dim=1)
+        a = torch.tanh(x @ p["W1"] + p["b1"])
         logits = a @ p["W2"] + p["b2"]
         return logits, (ctx, inst, mask, cnt, x, a)
 
     @staticmethod
     def _softmax(z):
-        z = z - z.max(axis=1, keepdims=True)
-        e = np.exp(z)
-        return e / e.sum(axis=1, keepdims=True)
+        z = z - z.max(dim=1, keepdim=True).values
+        e = torch.exp(z)
+        return e / e.sum(dim=1, keepdim=True)
 
     def _backward(self, probs, y, cache):
         ctx, inst, mask, cnt, x, a = cache
         p = self.params
-        B = len(y)
-        dlogits = probs.copy()
-        dlogits[np.arange(B), y] -= 1
+        B = y.shape[0]
+        dlogits = probs.clone()
+        dlogits[torch.arange(B, device=y.device), y] -= 1
         dlogits /= B
         g = {"W2": a.T @ dlogits, "b2": dlogits.sum(0)}
         dz = (dlogits @ p["W2"].T) * (1 - a ** 2)
@@ -336,11 +405,11 @@ class InstructGenerator:
         g["b1"] = dz.sum(0)
         dx = dz @ p["W1"].T
         nd = self.N * self.d
-        gE = np.zeros_like(p["E"])
-        np.add.at(gE, ctx, dx[:, :nd].reshape(B, self.N, self.d))
-        gC = np.zeros_like(p["C"])
+        gE = torch.zeros_like(p["E"])                       # np.add.at -> index_add_
+        gE.index_add_(0, ctx.reshape(-1), dx[:, :nd].reshape(B * self.N, self.d))
+        gC = torch.zeros_like(p["C"])
         rows = dx[:, None, nd:] * (mask / cnt)[:, :, None]
-        np.add.at(gC, inst, rows)
+        gC.index_add_(0, inst.reshape(-1), rows.reshape(-1, self.d))
         g["E"], g["C"] = gE, gC
         return g
 
@@ -348,9 +417,39 @@ class InstructGenerator:
         self._t += 1
         c1, c2 = 1 - b1 ** self._t, 1 - b2 ** self._t
         for k, g in grads.items():
-            self._m[k] = b1 * self._m[k] + (1 - b1) * g
-            self._v[k] = b2 * self._v[k] + (1 - b2) * g * g
-            self.params[k] -= lr * (self._m[k] / c1) / (np.sqrt(self._v[k] / c2) + eps)
+            m, v = self._m[k], self._v[k]
+            m.mul_(b1).add_(g, alpha=1 - b1)                # m = b1*m + (1-b1)*g
+            v.mul_(b2).addcmul_(g, g, value=1 - b2)         # v = b2*v + (1-b2)*g*g
+            denom = (v / c2).sqrt_().add_(eps)              # sqrt(v/c2) + eps
+            self.params[k].addcdiv_(m, denom, value=-lr / c1)   # p -= lr * (m/c1) / denom
+
+    @torch.no_grad()
+    def gradcheck(self, corpus, batch=64):
+        """Compare the manual gradients with torch.autograd on one real batch (float64)."""
+        if self.params is None:
+            self._init_params()
+        X, I, y = corpus.batch(self.rng, batch, self.N)
+        X, I, y = (self._to_dev(a) for a in (X, I, y))
+        saved = self.params
+        self.params = {k: v.double() for k, v in saved.items()}
+        logits, cache = self._forward(X, I)
+        probs = self._softmax(logits)
+        manual = self._backward(probs, y, cache)
+        with torch.enable_grad():
+            ag = {k: v.clone().requires_grad_(True) for k, v in self.params.items()}
+            self.params = ag
+            lg, _ = self._forward(X, I)
+            loss = torch.nn.functional.cross_entropy(lg, y)
+            loss.backward()
+        print("Gradient check (manual vs autograd, max abs diff):")
+        ok = True
+        for k in self.PARAM_KEYS:
+            diff = (manual[k] - ag[k].grad).abs().max().item()
+            ok &= diff < 1e-8
+            print(f"  {k:3s} {diff:.3e}")
+        self.params = saved
+        print("PASS" if ok else "FAIL")
+        return ok
 
     # -- training
     def _pad_inst(self, ids):
@@ -359,7 +458,7 @@ class InstructGenerator:
 
     def train_corpus(self, corpus, passes=1.0, batch=512, lr=3e-3, max_seconds=None,
                      log_every=200, save_path=None, checkpoint_every=0):
-        """Train on random positions of the on-disk corpus.
+        """Train on random positions of the on-disk corpus (on the GPU).
 
         passes: how many times the total number of target tokens to visit (1.0 = about
         one epoch; positions are sampled randomly, so it is approximate).
@@ -367,11 +466,13 @@ class InstructGenerator:
         """
         self._init_params()
         steps_total = max(1, int(passes * corpus.n_tokens / batch))
-        print(f"Vocab {len(self.vocab)}, {corpus.n_tokens:,} positions, "
+        print(f"Device {self.device}, vocab {len(self.vocab)}, {corpus.n_tokens:,} positions, "
               f"{steps_total:,} steps of {batch} ({passes} pass(es)).")
-        ar = np.arange(batch)
+        ar = torch.arange(batch, device=self.device)
+        loader = Prefetcher(corpus, batch, self.N, self.device, seed=self.seed)
         t0 = last_t = time.time()
-        run_loss, run_n = 0.0, 0
+        run_loss = torch.zeros((), device=self.device)
+        run_n = 0
         step = 0
         try:
             for step in range(steps_total):
@@ -385,43 +486,52 @@ class InstructGenerator:
                     frac = max(frac, elapsed / max_seconds)
                 cur_lr = lr * (1 - 0.9 * min(frac, 1.0))
 
-                X, I, y = corpus.batch(self.rng, batch, self.N)
-                logits, cache = self._forward(X, I)
-                probs = self._softmax(logits)
-                loss = float(-np.log(probs[ar, y] + 1e-9).mean())
-                self._adam(self._backward(probs, y, cache), cur_lr)
-                run_loss += loss
+                X, I, y = loader.get()
+                with torch.no_grad():
+                    logits, cache = self._forward(X, I)
+                    probs = self._softmax(logits)
+                    loss = -torch.log(probs[ar, y] + 1e-9).mean()
+                    self._adam(self._backward(probs, y, cache), cur_lr)
+                run_loss += loss                             # stays on the GPU, no sync per step
                 run_n += 1
 
                 if (step + 1) % log_every == 0:
+                    mean_loss = run_loss.item() / run_n      # one sync per log line
                     now = time.time()
                     rate = log_every * batch / max(now - last_t, 1e-9)
                     eta = (steps_total - step - 1) * batch / rate
                     if max_seconds:
                         eta = min(eta, max_seconds - (now - t0))
-                    print(f"  step {step + 1:,}/{steps_total:,}  loss {run_loss / run_n:.4f}  "
+                    print(f"  step {step + 1:,}/{steps_total:,}  loss {mean_loss:.4f}  "
                           f"{rate:,.0f} pos/s  ETA {max(eta, 0) / 60:.1f} min")
-                    run_loss, run_n, last_t = 0.0, 0, now
+                    run_loss.zero_()
+                    run_n, last_t = 0, now
                 if save_path and checkpoint_every and (step + 1) % checkpoint_every == 0:
                     self.save(save_path)
         except KeyboardInterrupt:
             print("\nInterrupted - keeping the current weights.")
+        finally:
+            loader.close()
+        if self.device.type == "cuda":
+            torch.cuda.synchronize()
         print(f"Training finished after {step + 1:,} steps ({(time.time() - t0) / 60:.1f} min).")
 
-    # -- save / load
+    # -- save / load  (same .npz format as the NumPy version)
     def save(self, path):
         cfg = json.dumps(dict(N=self.N, d=self.d, h=self.h, max_vocab=self.max_vocab,
                               max_inst=self.max_inst, max_resp=self.max_resp))
-        np.savez_compressed(path, vocab=np.array(self.vocab), cfg=np.array(cfg), **self.params)
+        arrays = {k: v.detach().cpu().numpy() for k, v in self.params.items()}
+        np.savez_compressed(path, vocab=np.array(self.vocab), cfg=np.array(cfg), **arrays)
 
     @classmethod
-    def load(cls, path):
+    def load(cls, path, device=None):
         z = np.load(path, allow_pickle=False)
         c = json.loads(str(z["cfg"]))
         m = cls(context=c["N"], embed_dim=c["d"], hidden=c["h"], max_vocab=c["max_vocab"],
-                max_inst=c["max_inst"], max_resp=c["max_resp"])
+                max_inst=c["max_inst"], max_resp=c["max_resp"], device=device)
         m.set_vocab(str(w) for w in z["vocab"])
-        m.params = {k: z[k] for k in ["E", "C", "W1", "b1", "W2", "b2"]}
+        m.params = {k: torch.from_numpy(z[k].astype(np.float32)).to(m.device)
+                    for k in cls.PARAM_KEYS}
         return m
 
     # -- text helpers
@@ -462,11 +572,26 @@ class InstructGenerator:
         """Collapse repeats/loops in text (kept for API compatibility)."""
         return self.detokenize(self._collapse(TOKEN_RE.findall(text)))
 
-    def _inconsistency(self, tokens):
-        """Evaluate: how many tokens of this prefix are self-repeats (loop residue)."""
-        return len(tokens) - len(self._collapse(tokens))
+    @staticmethod
+    def _repeat_ngrams(tokens, n=3):
+        """Positions whose n-gram already appeared earlier (catches non-adjacent loops)."""
+        low = [t.lower() for t in tokens]
+        seen, rep = set(), 0
+        for i in range(n - 1, len(low)):
+            g = tuple(low[i - n + 1:i + 1])
+            if g in seen:
+                rep += 1
+            else:
+                seen.add(g)
+        return rep
 
-    def liar_shift(self, tokens, tolerance=3):
+    def _inconsistency(self, tokens):
+        """Evaluate: self-repetition in this prefix = adjacent repeats/loops that
+        deconstruct would delete + repeated trigrams anywhere earlier in the text.
+        Both counts only grow as tokens are added, so truth is a step in the index."""
+        return (len(tokens) - len(self._collapse(tokens))) + self._repeat_ngrams(tokens)
+
+    def liar_shift(self, tokens, tolerance=2):
         """Index n of the first paradoxical prefix tokens[:n] (None if there is none).
 
         Truth value T(n) = "inconsistency of tokens[:n] < tolerance" is a step function
@@ -492,30 +617,35 @@ class InstructGenerator:
                 lo = mid
         return hi
 
+    @torch.no_grad()
     def _surprisal(self, inst_row, ids):
         """Mean negative log-likelihood (nats/token) of ids under the model."""
         if not ids:
             return 0.0
         L = len(ids)
-        S = [PAD] * (self.N - 1) + [RESP] + ids
-        W = np.array([S[j:j + self.N] for j in range(L)])
-        logits, _ = self._forward(W, np.repeat(inst_row[None, :], L, axis=0))
-        z = logits - logits.max(axis=1, keepdims=True)
-        logp = z - np.log(np.exp(z).sum(axis=1, keepdims=True))
-        return float(-logp[np.arange(L), ids].mean())
+        S = torch.tensor([PAD] * (self.N - 1) + [RESP] + ids, dtype=torch.long,
+                         device=self.device)
+        W = S.unfold(0, self.N, 1)[:L]                       # (L, N) sliding windows
+        logits, _ = self._forward(W, inst_row[None, :].expand(L, -1))
+        z = logits - logits.max(dim=1, keepdim=True).values
+        logp = z - torch.log(torch.exp(z).sum(dim=1, keepdim=True))
+        tgt = torch.tensor(ids, dtype=torch.long, device=self.device)
+        return float(-logp[torch.arange(L, device=self.device), tgt].mean())
 
     # -- generation
+    @torch.no_grad()
     def _sample(self, window, inst_row, temperature, top_k):
-        logits, _ = self._forward(np.array([window]), inst_row[None, :])
-        logits = logits[0].astype(np.float64) / max(temperature, 1e-4)
+        w = torch.tensor([window], dtype=torch.long, device=self.device)
+        logits, _ = self._forward(w, inst_row[None, :])
+        logits = logits[0].double() / max(temperature, 1e-4)
         for banned in (UNK, PAD, RESP):
-            logits[banned] = -np.inf
-        if top_k and top_k < len(logits):
-            cutoff = np.partition(logits, -top_k)[-top_k]
-            logits[logits < cutoff] = -np.inf
-        probs = self._softmax(logits[None, :])[0]
-        probs /= probs.sum()
-        return int(self.rng.choice(len(probs), p=probs))
+            logits[banned] = float("-inf")
+        if top_k and top_k < logits.shape[0]:
+            cutoff = torch.topk(logits, top_k).values[-1]
+            logits = logits.masked_fill(logits < cutoff, float("-inf"))
+        probs = torch.softmax(logits, dim=0)
+        probs = probs / probs.sum()
+        return int(torch.multinomial(probs, 1, generator=self.tgen).item())
 
     def _continue(self, prefix_tokens, inst_row, length, temperature, top_k):
         """Continue a response from prefix_tokens; stops at <|end|> or `length` tokens."""
@@ -531,12 +661,12 @@ class InstructGenerator:
         return out
 
     def generate(self, instruction, length=64, deconstruction_rounds=1,
-                 temperature=0.8, top_k=40, tolerance=3, return_trace=False):
+                 temperature=0.8, top_k=40, tolerance=2, return_trace=False):
         """Modal constructor / deconstructor loop.
 
         Construct : add up to `length` tokens (M).
         Evaluate  : exponential search for the liar shift - the index where the text
-                    turns paradoxical (>= `tolerance` self-repeating tokens).
+                    turns paradoxical (inconsistency score >= `tolerance`).
         Deconstruct: reset to the last consistent state (just before the shift) and
                     collapse remaining repeats (D), replacing the text.
         The trace holds the damage metrics of every round.
@@ -550,7 +680,8 @@ class InstructGenerator:
         if tolerance < 1:
             raise ValueError("Tolerance must be at least 1.")
 
-        inst_row = np.array(self._pad_inst(self._encode(tok(instruction))))
+        inst_row = torch.tensor(self._pad_inst(self._encode(tok(instruction))),
+                                dtype=torch.long, device=self.device)
         resp = self._continue([], inst_row, length, temperature, top_k)   # Construct
 
         trace = []
@@ -562,7 +693,8 @@ class InstructGenerator:
             trace.append(dict(
                 round=r + 1,
                 liar_shift=shift,
-                logical_collapse=(before - len(self._collapse(resp))) / max(before, 1),
+                length=before,
+                logical_collapse=min(1.0, self._inconsistency(resp) / max(before, 1)),
                 information_loss=(before - len(reduced)) / max(before, 1),
                 cognitive_overload=self._surprisal(inst_row, self._encode(resp)),
             ))
@@ -597,13 +729,27 @@ def main():
     ap.add_argument("--save", default=None, help="save trained model to this .npz")
     ap.add_argument("--checkpoint-every", type=int, default=20000, help="steps (needs --save)")
     ap.add_argument("--load", default=None, help="load a saved .npz instead of training")
-    ap.add_argument("--tolerance", type=int, default=3,
-                    help="self-repeating tokens that make a text 'paradoxical' (liar shift)")
+    ap.add_argument("--tolerance", type=int, default=2,
+                    help="inconsistency score (repeats) that makes a text 'paradoxical'; "
+                         "1 = most sensitive")
+    ap.add_argument("--temperature", type=float, default=0.8)
+    ap.add_argument("--top-k", type=int, default=40)
+    ap.add_argument("--device", default=None, help="cuda, cuda:1, cpu (default: cuda if available)")
+    ap.add_argument("--tf32", action="store_true",
+                    help="allow TF32 tensor-core matmuls (faster on Ampere+, slightly lower precision)")
+    ap.add_argument("--gradcheck", action="store_true",
+                    help="verify manual gradients against torch.autograd, then exit")
     ap.add_argument("--train-only", action="store_true", help="skip the interactive prompt")
     args = ap.parse_args()
 
+    device = get_device(args.device)
+    if device.type == "cuda":
+        torch.backends.cuda.matmul.allow_tf32 = args.tf32
+        torch.backends.cudnn.allow_tf32 = args.tf32
+        print(f"Using GPU: {torch.cuda.get_device_name(device)}")
+
     if args.load:
-        model = InstructGenerator.load(args.load)
+        model = InstructGenerator.load(args.load, device=device)
         print(f"Loaded model from {args.load} (vocab {len(model.vocab)}).")
     else:
         meta_path = os.path.join(args.cache_dir, "meta.json")
@@ -615,8 +761,12 @@ def main():
             print(f"Reusing encoded corpus in {args.cache_dir}/ (use --rebuild to redo).")
         corpus = Corpus(args.cache_dir)
         model = InstructGenerator(context=args.context, max_vocab=args.max_vocab,
-                                  max_inst=corpus.max_inst, max_resp=corpus.max_resp)
+                                  max_inst=corpus.max_inst, max_resp=corpus.max_resp,
+                                  device=device)
         model.set_vocab(corpus.vocab)
+        if args.gradcheck:
+            ok = model.gradcheck(corpus)
+            raise SystemExit(0 if ok else 1)
         model.train_corpus(corpus, passes=args.passes, batch=args.batch, lr=args.lr,
                            max_seconds=args.max_minutes * 60 if args.max_minutes else None,
                            save_path=args.save, checkpoint_every=args.checkpoint_every)
@@ -636,14 +786,9 @@ def main():
             length = int(input("Max tokens per pass: "))
             rounds = int(input("Deconstruction/regeneration rounds (0 = off): "))
             text, trace = model.generate(instruction, length, rounds,
+                                         temperature=args.temperature, top_k=args.top_k,
                                          tolerance=args.tolerance, return_trace=True)
             print("\n" + text)
-            for t in trace:
-                shift = "none" if t["liar_shift"] is None else f"token {t['liar_shift']}"
-                print(f"  [round {t['round']}] liar shift: {shift} | "
-                      f"logical collapse {t['logical_collapse']:.0%} | "
-                      f"info loss {t['information_loss']:.0%} | "
-                      f"overload {t['cognitive_overload']:.2f} nats/token")
         except ValueError as e:
             print("Invalid input:", e)
         except KeyboardInterrupt:
