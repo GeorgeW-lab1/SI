@@ -752,7 +752,7 @@ class InstructGenerator:
 # ------------------------------------------------------------------------ CLI
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--dataset", default="alphaXiv/AgentAlphaXiv",
+    ap.add_argument("--dataset", default="microsoft/orca-agentinstruct-1M-v1",
                     help="HF dataset id or local .jsonl file (.json loads fully into RAM)")
     ap.add_argument("--split", default="train")
     ap.add_argument("--config", default=None, help="HF dataset config / subset name")
