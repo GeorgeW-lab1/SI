@@ -600,7 +600,7 @@ def main():
     ap.add_argument("--cache-dir", default="corpus_cache", help="encoded corpus location")
     ap.add_argument("--rebuild", action="store_true", help="re-tokenize even if a cache exists")
     ap.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) - 1))
-    ap.add_argument("--vocab-examples", type=int, default=100_000)
+    ap.add_argument("--vocab-examples", type=int, default=100)
     ap.add_argument("--max-vocab", type=int, default=8000)
     ap.add_argument("--max-inst", type=int, default=32, help="instruction tokens kept")
     ap.add_argument("--max-resp", type=int, default=128, help="response tokens kept")
@@ -658,6 +658,8 @@ def main():
                                          temperature=args.temperature, top_k=args.top_k,
                                          tolerance=args.tolerance, return_trace=True)
             print("\n" + text)
+
+
         except ValueError as e:
             print("Invalid input:", e)
         except KeyboardInterrupt:
