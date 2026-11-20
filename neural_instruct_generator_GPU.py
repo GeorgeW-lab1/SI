@@ -706,7 +706,7 @@ class InstructGenerator:
 # ------------------------------------------------------------------------ CLI
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--dataset", default="tatsu-lab/alpaca",
+    ap.add_argument("--dataset", default="alphaXiv/AgentAlphaXiv",
                     help="HF dataset id or local .jsonl file (.json loads fully into RAM)")
     ap.add_argument("--split", default="train")
     ap.add_argument("--max-bytes", type=float, default=2e9,
@@ -731,8 +731,8 @@ def main():
     ap.add_argument("--tolerance", type=int, default=2,
                     help="inconsistency score (repeats) that makes a text 'paradoxical'; "
                          "1 = most sensitive")
-    ap.add_argument("--temperature", type=float, default=0.8)
-    ap.add_argument("--top-k", type=int, default=40)
+    ap.add_argument("--temperature", type=float, default=0.1)
+    ap.add_argument("--top-k", type=int, default=64)
     ap.add_argument("--device", default=None, help="cuda, cuda:1, cpu (default: cuda if available)")
     ap.add_argument("--tf32", action="store_true",
                     help="allow TF32 tensor-core matmuls (faster on Ampere+, slightly lower precision)")
