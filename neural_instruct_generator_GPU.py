@@ -833,7 +833,7 @@ def main():
     ap.add_argument("--max-bytes", type=float, default=2e9,
                     help="approx. characters of text to ingest (default 2e9 = ~2 GB cap)")
     ap.add_argument("--max-examples", type=int, default=None)
-    ap.add_argument("--cache-dir", default="agentalphaxiv_cache", help="encoded corpus location")
+    ap.add_argument("--cache-dir", default="cache", help="encoded corpus location")
     ap.add_argument("--rebuild", action="store_true", help="re-tokenize even if a cache exists")
     ap.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) - 1))
     ap.add_argument("--vocab-examples", type=int, default=100_000)
