@@ -522,29 +522,42 @@ class DecoderWorker:
             logits = result.logits[0, -1].to(self.device).float()
             self.cache = result.past_key_values
 
+            # Repetition control: adjust logits using the recent output window.
+            # This operates only on token selection and leaves the KV cache intact.
+            adjusted = logits.clone()
+            recent_ids = self.generated[-64:]
+            if recent_ids:
+                counts = Counter(recent_ids)
+                unique_ids = torch.tensor(list(counts.keys()), dtype=torch.long, device=self.device)
+                selected = adjusted[unique_ids]
+                repetition_penalty = 1.16
+                adjusted[unique_ids] = torch.where(
+                    selected > 0, selected / repetition_penalty, selected * repetition_penalty
+                )
+                count_values = torch.tensor(list(counts.values()), dtype=torch.float32, device=self.device)
+                adjusted[unique_ids] -= 0.035 * count_values
+
             temperature = min(0.55, max(0.20, float(control["temperature"])))
 
+
             if control["delayed_AND"]:
-                values, indices = torch.topk(
-                    logits / temperature,
-                    min(40, logits.shape[-1])
-                )
-
-                probabilities = torch.softmax(
-                    values,
-                    dim=-1
-                )
-
-                position = torch.multinomial(
-                    probabilities,
-                    num_samples=1
-                ).item()
-
-                token_id = int(indices[position].item())
-                mode = "sampling"
+                # Top-p nucleus sampling narrows the candidate set to plausible tokens.
+                scaled = adjusted / temperature
+                sorted_logits, sorted_indices = torch.sort(scaled, descending=True)
+                sorted_probs = torch.softmax(sorted_logits, dim=-1)
+                cumulative = torch.cumsum(sorted_probs, dim=-1)
+                top_p = 0.90
+                remove = cumulative > top_p
+                remove[1:] = remove[:-1].clone()
+                remove[0] = False
+                sorted_logits[remove] = -float("inf")
+                probs = torch.softmax(sorted_logits, dim=-1)
+                position = torch.multinomial(probs, num_samples=1).item()
+                token_id = int(sorted_indices[position].item())
+                mode = "top-p sampling"
             else:
-                token_id = int(torch.argmax(logits).item())
-                mode = "greedy"
+                token_id = int(torch.argmax(adjusted).item())
+                mode = "repetition-penalized greedy"
 
             self.generated.append(token_id)
 
