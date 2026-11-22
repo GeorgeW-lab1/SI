@@ -15,14 +15,14 @@ whatever subset the solver lands on. The report shows what that did to the proba
 which head tokens were kept or dropped, how much mass came from the tail, the solver error,
 and how the generated text differs from greedy and from plain sampling.
 
-SOLUTION MODE (--solution "text"): the target IS the solution (or a sketch of what it looks like).
-  1. FETCH      teacher-force GPT-2 along prompt + solution; per step fetch the top-K candidate pool,
-                the solution token's probability/rank, and the distribution's entropy / top-1 prob.
-  2. REGRESS    the smallest target mass at which the solution token becomes reachable is
+instruction MODE (--instruction "text"): the target IS the instruction (or a sketch of what it looks like).
+  1. FETCH      teacher-force GPT-2 along prompt + instruction; per step fetch the top-K candidate pool,
+                the instruction token's probability/rank, and the distribution's entropy / top-1 prob.
+  2. REGRESS    the smallest target mass at which the instruction token becomes reachable is
                 logit(needed) ~ a + b*entropy + c*log(top1)   (least squares, margin so training steps are covered).
   3. SOLVE      at each step the regressed mass is the solver's target; the subset sum picks the token set.
-  4. DECODE     subset ids -> token strings; check whether the solution token is inside, then run free
-                (no teacher) from the prompt with the regressed targets and compare with the solution text.
+  4. DECODE     subset ids -> token strings; check whether the instruction token is inside, then run free
+                (no teacher) from the prompt with the regressed targets and compare with the instruction text.
 
 Setup:   pip install torch transformers numpy
 Run:     python gpt2_subset_decode.py --prompt "The meaning of life is" --masses 0.3,0.6,0.9,0.99 --steps 12
@@ -88,7 +88,7 @@ class MockBackend:
 
     vocab = 50257
     eos = None
-    plant = None   # (prompt_ids, solution_ids): boosts the solution token so it has a realistic rank
+    plant = None   # (prompt_ids, instruction_ids): boosts the instruction token so it has a realistic rank
 
     def encode(self, text):
         return [sum(map(ord, w)) % self.vocab for w in text.split()] or [0]
@@ -104,7 +104,7 @@ class MockBackend:
             pr, sol = self.plant
             i = len(ids) - len(pr)
             if 0 <= i < len(sol) and list(ids) == list(pr) + list(sol[:i]):
-                target_rank = int(rng.geometric(0.02))            # solution token lands at a plausible rank
+                target_rank = int(rng.geometric(0.02))            # instruction token lands at a plausible rank
                 srt = np.sort(p)[::-1]
                 p[sol[i]] = srt[min(target_rank, self.vocab - 1)]
                 p = p / p.sum()
@@ -228,8 +228,8 @@ def greedy_text(backend, args):
 
 def run(args):
     backend = MockBackend() if args.mock else GPT2Backend(args.model)
-    if args.solution:
-        return run_solution(backend, args)
+    if args.instruction:
+        return run_instruction(backend, args)
     masses = [float(m) for m in args.masses.split(",")] if args.masses else [args.mass]
 
     print("=" * 78)
@@ -264,7 +264,7 @@ def run(args):
         plot(results[-1]["log"], args)
 
 
-# ---------------------------------------------------------------- solution mode
+# ---------------------------------------------------------------- instruction mode
 def pool_step(probs, pool_ids, frac, scale_bits, engine, max_steps, seed):
     """Solver on the top-K pool. frac = target as a fraction of the pool's total mass."""
     scale = 1 << scale_bits
@@ -288,17 +288,17 @@ def logit(x):
     return math.log(x / (1 - x))
 
 
-def run_solution(backend, args):
+def run_instruction(backend, args):
     K = args.pool
     prompt_ids = backend.encode(args.prompt)
-    sol_ids = backend.encode(" " + args.solution.strip()) if not args.mock else backend.encode(args.solution)
+    sol_ids = backend.encode(" " + args.instruction.strip()) if not args.mock else backend.encode(args.instruction)
     if args.mock:
         backend.plant = (prompt_ids, sol_ids)
     dec = lambda ids: "".join(backend.decode(t) for t in ids)
 
     print("=" * 78)
-    print(f"SOLUTION MODE | prompt: {args.prompt!r}")
-    print(f"solution (target): {args.solution!r} -> {len(sol_ids)} tokens: "
+    print(f"instruction MODE | prompt: {args.prompt!r}")
+    print(f"instruction (target): {args.instruction!r} -> {len(sol_ids)} tokens: "
           + " ".join(repr(backend.decode(t)) for t in sol_ids)
           + (" | MOCK DISTRIBUTION (not GPT-2)" if args.mock else ""))
     print("=" * 78)
@@ -317,7 +317,7 @@ def run_solution(backend, args):
                      "ltop": ltop, "needed": needed, "pool": pool, "probs": probs})
         ctx.append(t)
     inpool = [r for r in rows if r["needed"] is not None]
-    print(f"\n[1] FETCH: {len(inpool)}/{len(rows)} solution tokens lie inside the top-{K} pool")
+    print(f"\n[1] FETCH: {len(inpool)}/{len(rows)} instruction tokens lie inside the top-{K} pool")
 
     # 2. REGRESS
     if len(inpool) >= 4:
@@ -337,9 +337,9 @@ def run_solution(backend, args):
         print(f"[2] REGRESS: too few in-pool points for a fit; using constant target {mx:.3f}")
     predict = lambda ent, ltop: min(0.999, 1 / (1 + math.exp(-(coef[0] + coef[1] * ent + coef[2] * ltop))))
 
-    # 3+4a. SOLVE + DECODE along the solution (teacher-forced)
-    print("\n[3] SOLVE + DECODE along the solution (teacher-forced):")
-    print(f"  {'step':>4} {'solution tok':<16} {'rank':>6} {'p':>8} {'needed':>7} {'target':>7} "
+    # 3+4a. SOLVE + DECODE along the instruction (teacher-forced)
+    print("\n[3] SOLVE + DECODE along the instruction (teacher-forced):")
+    print(f"  {'step':>4} {'instruction tok':<16} {'rank':>6} {'p':>8} {'needed':>7} {'target':>7} "
           f"{'subset':>7} {'in subset?':>10}")
     hits = 0
     for r in rows:
@@ -353,7 +353,7 @@ def run_solution(backend, args):
         if r["i"] == 0:
             first = sorted(out["chosen"], key=lambda i: -r["probs"][i])[:args.show]
             first_rows = [(i, float(r["probs"][i])) for i in first]
-    print(f"  solution tokens recovered inside the solver's subset: {hits}/{len(rows)}")
+    print(f"  instruction tokens recovered inside the solver's subset: {hits}/{len(rows)}")
     print(f"\n  decoded subset at step 1 (top {len(first_rows)} by prob):")
     for i, p in first_rows:
         print(f"     id {i:>6} p={p:.5f}  {fmt_tok(backend.decode(i))!r}")
@@ -361,7 +361,7 @@ def run_solution(backend, args):
     # 4b. FREE RUN with regressed targets
     n_free = args.max_tokens if args.max_tokens > 0 else len(sol_ids)
     print(f"\n[4] FREE RUN from the prompt with regressed targets (max {n_free} tokens, "
-          f"stops at end-of-text; the solution is not shown to the model):")
+          f"stops at end-of-text; the instruction is not shown to the model):")
     rng = np.random.default_rng(args.seed)
     ctx = list(prompt_ids)
     every = 1 if n_free <= 40 else 25
@@ -379,7 +379,7 @@ def run_solution(backend, args):
         if step % every == 0:
             want = sol_ids[step] if step < len(sol_ids) else None
             tail = ("" if want is None else
-                    f" | solution wanted {fmt_tok(backend.decode(want))!r} "
+                    f" | instruction wanted {fmt_tok(backend.decode(want))!r} "
                     f"{'(in subset)' if want in set(out['chosen']) else '(outside subset)'}")
             print(f"  step {step + 1}: entropy {ent:.2f} -> target {tgt:.3f} | subset {len(out['chosen']):,} | "
                   f"sampled {fmt_tok(backend.decode(nxt))!r}{tail} | {time.perf_counter() - t0:.0f}s")
@@ -396,15 +396,15 @@ def run_solution(backend, args):
         print(f"\nfull decoded text written to {args.out}")
 
     print("\n" + "=" * 78)
-    print("TARGET (SOLUTION) vs DECODED")
+    print("TARGET (instruction) vs DECODED")
     print("=" * 78)
-    print(f"solution    : {args.prompt}{dec(sol_ids)!r}")
+    print(f"instruction    : {args.prompt}{dec(sol_ids)!r}")
     print(f"decoded     : {args.prompt}{full_text!r}")
     print(f"\n--- decoded text (rendered, {len(gen)} tokens, mean subset {np.mean(sizes):,.0f}) ---")
     print(args.prompt + full_text)
     print("--- end ---\n")
-    print(f"exact token matches (first {len(sol_ids)} positions) {match}/{len(sol_ids)} | solution tokens inside solver subset {hits}/{len(rows)}")
-    print("note: 'inside subset' measures whether the regressed target made the solution reachable; "
+    print(f"exact token matches (first {len(sol_ids)} positions) {match}/{len(sol_ids)} | instruction tokens inside solver subset {hits}/{len(rows)}")
+    print("note: 'inside subset' measures whether the regressed target made the instruction reachable; "
           "'exact matches' also needs sampling to pick it.")
 
 
@@ -438,10 +438,10 @@ if __name__ == "__main__":
     ap.add_argument("--model", default="gpt2")
     ap.add_argument("--mass", type=float, default=0.90, help="target probability mass in (0,1)")
     ap.add_argument("--masses", default="", help="comma list of targets to compare, e.g. 0.3,0.6,0.9,0.99")
-    ap.add_argument("--solution", default="i don't know, why don't you tell me?", help="target text (the solution / what it could look like)")
+    ap.add_argument("--instruction", default="", help="target text (the instruction / what it could look like)")
     ap.add_argument("--max-tokens", type=int, default=240,
-                    help="solution mode: tokens to generate in the free run (0 = length of the solution; e.g. 1000)")
-    ap.add_argument("--out", default="", help="solution mode: write the full decoded text to this file")
+                    help="instruction mode: tokens to generate in the free run (0 = length of the instruction; e.g. 1000)")
+    ap.add_argument("--out", default="", help="instruction mode: write the full decoded text to this file")
     ap.add_argument("--pool", type=int, default=200, help="top-K candidate tokens fetched per step")
     ap.add_argument("--margin", type=float, default=0.0, help="extra logit margin on the regressed target")
     ap.add_argument("--quiet", action="store_true", help="hide per-step detail, show only decoded subset + text")
