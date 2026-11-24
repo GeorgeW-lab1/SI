@@ -747,7 +747,7 @@ class PhotonicBenchModel:
     THRESHOLD = 0.7
     AND_DELAY = 0.050
     CLOCK_PERIOD = 0.0000100
-    INPUT_PERIOD = 0.100
+    INPUT_PERIOD = 0.0000100
 
     def __init__(
         self,
