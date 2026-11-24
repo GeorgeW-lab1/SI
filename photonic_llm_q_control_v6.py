@@ -1,3 +1,4 @@
+import contextlib
 import csv
 import math
 import queue
@@ -14,7 +15,7 @@ except ImportError:
     AutoTokenizer = None
     AutoModelForCausalLM = None
     HAS_TRANSFORMERS = False
-from collections import Counter, deque
+from collections import deque
 from tkinter import filedialog, messagebox, ttk
 
 try:
@@ -49,17 +50,35 @@ What is new in this version (making it an actual pattern recogniser)
    by the queue length). On a stream that repeats at that lag this match rate
    climbs far above chance. The old "queue vs pre-delay AND" probe is kept, but it
    compares two different functions, so it only measures coincidence.
-3. Lag sweep (autocorrelation): for every lag 1..N, match rate vs the chance
-   baseline p1^2 + (1-p1)^2, with z-scores, a significance line, and automatic
-   detection of the repeat period.
 
 LLM link: the prompt is encoded as bits and gates Driver A; each Q-high rising
 edge is one token-acceptance credit for a Hugging Face causal LM (KV-cached
-decoding). The lag sweep shows whether a stream is looping / repeating.
+decoding).
 
 """
 
 STREAM_MODES = ("Repeating bits", "Text stream")
+
+# None -> the photonic circuit runs on the same device as the LLM (GPU if present).
+# Set to "cpu" only to compare against the GPU path.
+CIRCUIT_DEVICE = None
+
+
+def pick_device() -> "torch.device":
+    """Best available accelerator: CUDA, then Apple MPS, then CPU."""
+    if torch.cuda.is_available():
+        return torch.device("cuda", torch.cuda.current_device())
+    mps = getattr(torch.backends, "mps", None)
+    if mps is not None and mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
+def describe_device(dev) -> str:
+    if dev.type == "cuda":
+        return f"{dev} ({torch.cuda.get_device_name(dev)})"
+    return str(dev)
+
 
 def mw_to_dbm(power_mw: float) -> float:
     return 10.0 * math.log10(max(power_mw, 1e-12))
@@ -248,6 +267,7 @@ class DecoderWorker:
         self.attention_mask = None
         self.last_accepted_q_edge = 0
         self.generated = []
+        self.generated_t = None  # same tokens, resident on the model device
         self.max_tokens = 128
         self.last_q_latency_ms = 0.0
         self.total_q_latency_ms = 0.0
@@ -320,14 +340,16 @@ class DecoderWorker:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-        device = torch.device(
-            "cuda" if torch.cuda.is_available() else "cpu"
-        )
+        device = pick_device()
 
         # Faster attention + reduced precision on supported hardware.
         load_kwargs = {"trust_remote_code": False}
         if device.type == "cuda":
-            load_kwargs["torch_dtype"] = torch.float16
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            load_kwargs["torch_dtype"] = (
+                torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+            )
             load_kwargs["attn_implementation"] = "sdpa"
 
         tokenizer = AutoTokenizer.from_pretrained(
@@ -357,7 +379,8 @@ class DecoderWorker:
 
         self.events.put((
             "loaded",
-            {"message": f"Model loaded on {device}."}
+            {"message": f"Model loaded on {describe_device(device)}."
+                        + ("" if device.type != "cpu" else " WARNING: no GPU found, running on CPU.")}
         ))
 
     def start_session(self, data):
@@ -473,6 +496,7 @@ class DecoderWorker:
         self.attention_mask = attention_mask
         self.last_accepted_q_edge = 0
         self.generated = []
+        self.generated_t = torch.empty(0, dtype=torch.long, device=self.device)
         self.last_q_latency_ms = 0.0
         self.total_q_latency_ms = 0.0
         self.active = True
@@ -554,17 +578,14 @@ class DecoderWorker:
             # Repetition control changes token-selection logits only; the prompt,
             # token input, positions, and KV cache remain untouched.
             adjusted = logits.clone()
-            recent_ids = self.generated[-64:]
-            if recent_ids:
-                counts = Counter(recent_ids)
-                unique_ids = torch.tensor(list(counts.keys()), dtype=torch.long, device=self.device)
+            if self.generated_t.numel() > 0:
+                unique_ids, count_values = torch.unique(self.generated_t[-64:], return_counts=True)
                 selected = adjusted[unique_ids]
                 repetition_penalty = 1.16
                 adjusted[unique_ids] = torch.where(
                     selected > 0, selected / repetition_penalty, selected * repetition_penalty
                 )
-                count_values = torch.tensor(list(counts.values()), dtype=torch.float32, device=self.device)
-                adjusted[unique_ids] -= 0.035 * count_values
+                adjusted[unique_ids] -= 0.035 * count_values.to(torch.float32)
 
             # Conservative exact n-gram loop detector. On three repeated cycles,
             # penalize loop tokens and block the token that would continue the
@@ -605,19 +626,17 @@ class DecoderWorker:
             remove[0] = False
             sorted_logits[remove] = -float("inf")
             probs = torch.softmax(sorted_logits, dim=-1)
-            position = torch.multinomial(probs, num_samples=1).item()
-            token_id = int(sorted_indices[position].item())
+            position_t = torch.multinomial(probs, num_samples=1)
+            token_t = sorted_indices[position_t]  # stays on the device
+            token_id = int(token_t.item())        # one sync: Python needs the id for decode/EOS
             mode = ("loop-escape top-p sampling" if loop_info
                     else "Q-accepted top-p sampling")
 
             self.generated.append(token_id)
+            self.generated_t = torch.cat((self.generated_t, token_t.to(torch.long).view(1)))
             self.last_accepted_q_edge = q_edge
 
-            self.next_input = torch.tensor(
-                [[token_id]],
-                dtype=torch.long,
-                device=self.device
-            )
+            self.next_input = token_t.to(torch.long).view(1, 1)
             # The sampled token has not yet been consumed by the model. Extend
             # the mask now so the next Q-accepted call sees [cached prefix + token].
             next_mask_bit = torch.ones(
@@ -739,7 +758,16 @@ class WebcamWorker:
 
 
 class PhotonicBenchModel:
-    """End-to-end photonic + logic discrete-step simulation engine."""
+    """
+    End-to-end photonic + logic discrete-step simulation engine.
+
+    The circuit state and every per-step computation live on the compute device
+    (GPU when available): laser Tx + RIN noise, coupler/photodiodes, TIA, RC node,
+    comparator, AND/OR gates, the 150 ms delay line, the D-queue (a ring buffer)
+    and the 74HC74 latch (Q). Python only supplies the input symbol, keeps the
+    bookkeeping (probes, history, CSV records) and reads one packed result vector
+    back per step.
+    """
 
     DT = 0.005
     RC_TAU = 0.050
@@ -769,6 +797,7 @@ class PhotonicBenchModel:
         pattern_bits: str = "1101001",
         stream_text: str = "the cat sat on the mat. ",
         stream_noise: float = 0.0,
+        device=None,
     ):
         self.probe_steps = max(1, int(round(probe_duration / self.DT)))
         self.total_steps = 2 * self.probe_steps
@@ -802,20 +831,40 @@ class PhotonicBenchModel:
         self.clock_steps = max(1, int(round(self.CLOCK_PERIOD / self.DT)))
         self.input_steps = max(1, int(round(self.INPUT_PERIOD / self.DT)))
 
+        self.device = torch.device(device) if device is not None else pick_device()
+        # MPS has no float64; everywhere else the analog path is float64 so the
+        # RC / comparator threshold behaves exactly like the scalar reference.
+        self.fdtype = torch.float32 if self.device.type == "mps" else torch.float64
+        # Own CUDA stream: the per-step readback must not wait for the LLM's
+        # forward pass running on the default stream in the decoder thread.
+        self.stream = torch.cuda.Stream(self.device) if self.device.type == "cuda" else None
+
         self.reset()
+
+    def _ctx(self):
+        return torch.cuda.stream(self.stream) if self.stream is not None else contextlib.nullcontext()
+
+    def _scalar(self, value: float):
+        return torch.tensor(float(value), dtype=self.fdtype, device=self.device)
 
     def set_queue_length(self, new_length: int):
         new_length = max(1, int(new_length))
-        self.d_queue_length = new_length
-        while len(self.d_bit_queue) > new_length:
-            self.d_bit_queue.popleft()
-        while len(self.d_bit_queue) < new_length:
-            self.d_bit_queue.appendleft(self.queue_rng.randrange(2))
-        self.d_queued = self.d_bit_queue[0]
+        with self._ctx():
+            ordered = torch.roll(self.qbuf, -self.qpos)  # oldest -> newest
+            old = ordered.numel()
+            if new_length < old:
+                ordered = ordered[old - new_length:]  # drop the oldest bits
+            elif new_length > old:
+                fill = [self.queue_rng.randrange(2) for _ in range(new_length - old)]
+                pad = torch.tensor(fill[::-1], dtype=self.fdtype, device=self.device)
+                ordered = torch.cat((pad, ordered))   # prepend (oldest side)
+            self.qbuf = ordered.contiguous().clone()
+            self.qpos = 0
+            self.d_queue_length = new_length
+            self.d_queued = int(self.qbuf[0].item())
 
     def reset(self):
         self.input_rng = random.Random(self.seed)
-        self.photonic_rng = random.Random(self.seed + 2)
         self.queue_rng = random.Random(self.seed + 3)
         self.stream_rng = random.Random(self.seed + 4)
 
@@ -844,10 +893,38 @@ class PhotonicBenchModel:
         self.y = 0
         self.d = 0
 
-        self.d_bit_queue: deque[int] = deque(
-            self.queue_rng.randrange(2) for _ in range(self.d_queue_length)
-        )
-        self.d_queued = self.d_bit_queue[0]
+        # ---- device-resident circuit state ----
+        f, dev = self.fdtype, self.device
+        with self._ctx():
+            self.rng_gen = torch.Generator(device=dev)
+            self.rng_gen.manual_seed(self.seed + 2)
+
+            er_linear = db_to_linear(self.extinction_db)
+            self.low_mw = self.laser_power_mw / max(er_linear, 1.0)
+            loss_lin = db_to_linear(-self.insertion_loss_db)
+            split_a = min(max(self.split_ratio_a, 0.0), 1.0)
+            split_b = 1.0 - split_a
+            ua = self.responsivity_a_per_w * 1000.0
+            # tx -> [Tx mW, PD-A mW, PD-B mW, PD-A uA, PD-B uA]
+            self.chain_coeff = torch.tensor(
+                [1.0, split_a * loss_lin, split_b * loss_lin,
+                 split_a * loss_lin * ua, split_b * loss_lin * ua],
+                dtype=f, device=dev,
+            )
+            self.rc_decay = math.exp(-self.DT / self.RC_TAU)
+            self.delay_gain = db_to_linear(-self.delay_loss_db)
+
+            self.t_zero = self._scalar(0.0)
+            self.t_one = self._scalar(1.0)
+            self.t_rc = self._scalar(0.0)   # RC capacitor voltage
+            self.t_q = self._scalar(0.0)    # 74HC74 Q (SELECT)
+            self.and_hist = torch.zeros(self.total_steps, dtype=f, device=dev)
+            self.opt_hist = torch.zeros(self.total_steps, dtype=f, device=dev)
+
+            init = [self.queue_rng.randrange(2) for _ in range(self.d_queue_length)]
+            self.qbuf = torch.tensor(init, dtype=f, device=dev)  # ring buffer, oldest at qpos
+            self.qpos = 0
+            self.d_queued = init[0]
 
         self.post_queue_and = 0
 
@@ -874,9 +951,21 @@ class PhotonicBenchModel:
         self.accumulator = 1
         self.accumulator_samples = 0
 
-        self.and_history: list[int] = []
-        self.optical_and_history: list[float] = []
         self.records: list[dict] = []
+
+    def queue_preview(self) -> str:
+        """First 6 / last 4 queue bits (oldest -> newest), gathered on the device."""
+        n = self.qbuf.numel()
+        if n > 12:
+            idx = [(self.qpos + i) % n for i in range(6)] + [(self.qpos + n - 4 + i) % n for i in range(4)]
+        else:
+            idx = [(self.qpos + i) % n for i in range(n)]
+        with self._ctx():
+            vals = self.qbuf[torch.tensor(idx, device=self.device)].tolist()
+        bits = "".join(str(int(round(v))) for v in vals)
+        if n > 12:
+            bits = bits[:6] + ".." + bits[6:]
+        return f"[{bits}] ({n}/{self.d_queue_length})"
 
     @property
     def finished(self) -> bool:
@@ -939,85 +1028,98 @@ class PhotonicBenchModel:
         self._update_inputs(cam_a=cam_a, cam_b=cam_b)
 
         self.driver_a_select_gate = self.q if self.feed_select_to_driver_a else 1
-        self.a = self.driver_a_raw & self.driver_a_select_gate
 
-        er_linear = db_to_linear(self.extinction_db)
-        low_mw = self.laser_power_mw / max(er_linear, 1.0)
-        base_tx_mw = self.laser_power_mw if self.x else low_mw
-        rin_factor = 1.0 + self.photonic_rng.gauss(0.0, self.optical_noise_std)
-        self.optical_tx_mw = max(0.0, base_tx_mw * rin_factor)
+        i = self.step_index
+        delayed_idx = i - self.delay_steps
+        completed = i + 1
+        phase = completed % self.clock_steps
+        rising_edge = phase == 0
+        f, dev = self.fdtype, self.device
 
+        # ---------------- circuit step, entirely on the device ----------------
+        with self._ctx():
+            inp = torch.tensor([float(self.x), float(self.driver_a_raw)], dtype=f, device=dev)
+            x_t, raw_t = inp[0], inp[1]
+
+            gate = self.t_q if self.feed_select_to_driver_a else self.t_one
+            a_t = raw_t * gate                                   # Driver A (SELECT-gated)
+
+            base = self.low_mw + (self.laser_power_mw - self.low_mw) * x_t   # laser: ER high/low
+            if self.optical_noise_std > 0.0:                                 # RIN
+                noise = torch.randn((), generator=self.rng_gen, device=dev, dtype=f)
+                base = base * (1.0 + self.optical_noise_std * noise)
+            tx_t = torch.clamp(base, min=0.0)
+
+            chain = tx_t * self.chain_coeff                      # coupler + photodiodes
+            if self.mode == "Photonic TIA":
+                drive = torch.clamp(chain[4] * (self.tia_gain_v_per_ma / 1000.0), max=self.SUPPLY)
+            else:
+                drive = x_t * self.SUPPLY
+            rc_t = drive + (self.t_rc - drive) * self.rc_decay   # RC node
+            b_t = (rc_t > self.THRESHOLD).to(f)                  # comparator
+
+            pre_t = a_t * b_t                                    # AND (pre-delay)
+            if delayed_idx >= 0:                                 # 150 ms delay line
+                delayed_t = self.and_hist[delayed_idx]
+                opt_del_t = self.opt_hist[delayed_idx] * self.delay_gain
+            else:
+                delayed_t = self.t_zero
+                opt_del_t = self.t_zero
+            self.and_hist[i] = pre_t
+            self.opt_hist[i] = tx_t * pre_t
+
+            y_t = torch.maximum(a_t, b_t)                        # OR
+            d_t = torch.maximum(delayed_t, y_t)                  # OR with delayed AND
+
+            dq_t = self.qbuf[self.qpos].clone()                  # FIFO queue (ring buffer)
+            self.qbuf[self.qpos] = d_t
+            post_t = dq_t * b_t
+            same_t = (dq_t == d_t).to(f)
+
+            self.t_rc = rc_t
+            if rising_edge:                                      # 74HC74: Q <- Dq on clock edge
+                self.t_q = dq_t
+
+            out = torch.stack([
+                tx_t, chain[1], chain[2], chain[3], chain[4], opt_del_t,
+                a_t, rc_t, b_t, pre_t, delayed_t, y_t, d_t, dq_t, post_t, same_t,
+            ]).tolist()                                          # single device -> host read
+        self.qpos = (self.qpos + 1) % self.qbuf.numel()
+
+        (tx, a_mw, b_mw, iph_a, iph_b, opt_del, a, rc, b, pre, delayed, y, d, dq, post, same_v) = out
+        self.optical_tx_mw = tx
+        self.optical_a_mw = a_mw
+        self.optical_b_mw = b_mw
+        self.photocurrent_a_ua = max(0.0, iph_a)
+        self.photocurrent_b_ua = max(0.0, iph_b)
+        self.optical_delayed_mw = opt_del
         self.optical_phase_rad = (
             self.optical_phase_rad + 2.0 * math.pi * 1.5 * self.DT
         ) % (2.0 * math.pi)
-
-        loss_lin = db_to_linear(-self.insertion_loss_db)
-        split_a = min(max(self.split_ratio_a, 0.0), 1.0)
-        split_b = 1.0 - split_a
-
-        self.optical_a_mw = self.optical_tx_mw * split_a * loss_lin
-        self.optical_b_mw = self.optical_tx_mw * split_b * loss_lin
-
-        self.photocurrent_a_ua = max(0.0, self.optical_a_mw * self.responsivity_a_per_w * 1000.0)
-        self.photocurrent_b_ua = max(0.0, self.optical_b_mw * self.responsivity_a_per_w * 1000.0)
-
-        if self.mode == "Photonic TIA":
-            drive_v_target = min(
-                self.SUPPLY,
-                (self.photocurrent_b_ua / 1000.0) * self.tia_gain_v_per_ma,
-            )
-        else:
-            drive_v_target = self.SUPPLY * self.x
-
-        decay = math.exp(-self.DT / self.RC_TAU)
-        self.rc_voltage = drive_v_target + (self.rc_voltage - drive_v_target) * decay
-        self.b = int(self.rc_voltage > self.THRESHOLD)
-
-        self.pre_delay_and = self.a & self.b
+        self.a = int(round(a))
+        self.rc_voltage = rc
+        self.b = int(round(b))
+        self.pre_delay_and = int(round(pre))
         self.truth = self.pre_delay_and
-        self.and_history.append(self.pre_delay_and)
-
-        opt_and_mw = self.optical_tx_mw if self.pre_delay_and else 0.0
-        self.optical_and_history.append(opt_and_mw)
-
-        delayed_idx = self.step_index - self.delay_steps
-        if delayed_idx >= 0:
-            self.delayed_and = self.and_history[delayed_idx]
-            self.optical_delayed_mw = (
-                self.optical_and_history[delayed_idx] * db_to_linear(-self.delay_loss_db)
-            )
-        else:
-            self.delayed_and = 0
-            self.optical_delayed_mw = 0.0
-
-        self.y = self.a | self.b
-        self.d = self.delayed_and | self.y
-
-        self.d_bit_queue.append(int(self.d))
-        if len(self.d_bit_queue) > self.d_queue_length:
-            self.d_queued = self.d_bit_queue.popleft()
-        else:
-            self.d_queued = self.d_bit_queue[0]
-        effective_queue_steps = max(0, len(self.d_bit_queue) - 1)
-
-        self.post_queue_and = self.d_queued & self.b
-        self.last_lag_steps = effective_queue_steps
+        self.delayed_and = int(round(delayed))
+        self.y = int(round(y))
+        self.d = int(round(d))
+        self.d_queued = int(round(dq))
+        self.post_queue_and = int(round(post))
+        self.last_lag_steps = max(0, self.qbuf.numel() - 1)
 
         # Like-with-like probe: lagged D vs D now, only once real data has propagated
         self_cell: int | str = ""
         if self.step_index >= self.d_queue_length:
-            same = int(self.d_queued == self.d)
+            same = int(round(same_v))
             self.last_self_match = same
             self.self_lag_count += 1
             self.self_lag_matches += same
             self_cell = same
 
-        completed = self.step_index + 1
         self.time = completed * self.DT
 
-        phase = completed % self.clock_steps
         self.clock = int(phase < self.clock_steps // 2)
-        rising_edge = phase == 0
 
         if rising_edge:
             self.q = self.d_queued
@@ -1066,7 +1168,7 @@ class PhotonicBenchModel:
             "delayed_and": self.delayed_and,
             "Y_or": self.y,
             "D_raw_or": self.d,
-            "d_queue_len": len(self.d_bit_queue),
+            "d_queue_len": self.qbuf.numel(),
             "queue_lag_steps": self.last_lag_steps,
             "queue_lag_ms": round(self.last_lag_steps * self.DT * 1000.0, 2),
             "D_queued": self.d_queued,
@@ -1093,15 +1195,12 @@ class PhotonicBenchModel:
 
 
 class PhotonicCircuitSimulator(tk.Tk):
+    # Below these sizes the canvases stop shrinking and scroll instead.
+    CIRCUIT_MIN_W, CIRCUIT_MIN_H = 1160, 520
+    WAVE_MIN_W = 1000
+
     ROI_A = (0.58, 0.25, 0.92, 0.75)  # Right ROI
     ROI_B = (0.08, 0.25, 0.42, 0.75)  # Left ROI
-
-    LAG_SIGNALS = {
-        "x (input stream)": "optical_x",
-        "D (OR out)": "D_raw_or",
-        "pre-delay AND": "pre_delay_and",
-        "Q / SELECT": "Q_SELECT",
-    }
 
     def __init__(self):
         super().__init__()
@@ -1109,12 +1208,17 @@ class PhotonicCircuitSimulator(tk.Tk):
         self.geometry("1380x1060")
         self.minsize(960, 620)
 
+        self.device = torch.device(CIRCUIT_DEVICE) if CIRCUIT_DEVICE else pick_device()
+        self.device_var = tk.StringVar(value=(
+            f"Compute device: {describe_device(self.device)} — photonic circuit + LLM"
+            if self.device.type != "cpu"
+            else "Compute device: CPU — WARNING: no GPU found (photonic circuit + LLM on CPU)"
+        ))
         self.after_id: str | None = None
         self.cam_after_id: str | None = None
         self.resize_after_id: str | None = None
         self.running = False
         self.model: PhotonicBenchModel | None = None
-        self.lag_result: dict | None = None
         self.prompt_bits = [0]
         self.prompt_bit_index = 0
         self.llm_decoder = DecoderWorker()
@@ -1135,7 +1239,6 @@ class PhotonicCircuitSimulator(tk.Tk):
         self.llm_token_status_var = tk.StringVar(value="Tokens: 0")
         self.llm_prompt_text = None
         self.llm_output_text = None
-        self.lag_info_var = tk.StringVar(value="Lag sweep: run the simulation, then press Analyse lags.")
 
         self.webcam: WebcamWorker | None = None
         self.latest_capture_time: float | None = None
@@ -1157,9 +1260,6 @@ class PhotonicCircuitSimulator(tk.Tk):
         self.pattern_var = tk.StringVar(value="1101001")
         self.text_var = tk.StringVar(value="the cat sat on the mat. ")
         self.stream_noise_var = tk.StringVar(value="0.0")
-
-        self.lag_signal_var = tk.StringVar(value="x (input stream)")
-        self.max_lag_var = tk.StringVar(value="256")
 
         self.cam_index_var = tk.StringVar(value="0")
         self.cam_thresh_var = tk.DoubleVar(value=130.0)
@@ -1220,6 +1320,8 @@ class PhotonicCircuitSimulator(tk.Tk):
         self.scroll_canvas.itemconfigure(self._scroll_window_id, width=event.width)
 
     def _on_mousewheel(self, event):
+        if isinstance(event.widget, tk.Text):
+            return  # the Text widget scrolls itself; don't also scroll the page
         if getattr(event, "num", None) == 4:
             self.scroll_canvas.yview_scroll(-3, "units")
         elif getattr(event, "num", None) == 5:
@@ -1304,16 +1406,26 @@ class PhotonicCircuitSimulator(tk.Tk):
         ttk.Button(btns, text="Run to end", command=self.run_to_end).pack(side="left", padx=4)
         ttk.Button(btns, text="Export CSV", command=self.export_csv).pack(side="left", padx=4)
 
+        ttk.Label(root, textvariable=self.device_var, padding=(12, 2)).pack(fill="x")
         ttk.Label(root, textvariable=self.status_var, padding=(12, 2)).pack(fill="x")
         ttk.Label(root, textvariable=self.photonic_var, padding=(12, 2)).pack(fill="x")
 
         middle = ttk.Frame(root)
         middle.pack(fill="both", expand=True, padx=10, pady=4)
 
+        circuit_box = ttk.Frame(middle)
+        circuit_box.pack(side="left", fill="both", expand=True)
         self.canvas = tk.Canvas(
-            middle, background="white", height=520, highlightthickness=1, highlightbackground="#d9e2e8"
+            circuit_box, background="white", height=520, highlightthickness=1, highlightbackground="#d9e2e8"
         )
-        self.canvas.pack(side="left", fill="both", expand=True)
+        circuit_v = ttk.Scrollbar(circuit_box, orient="vertical", command=self.canvas.yview)
+        circuit_h = ttk.Scrollbar(circuit_box, orient="horizontal", command=self.canvas.xview)
+        self.canvas.configure(xscrollcommand=circuit_h.set, yscrollcommand=circuit_v.set)
+        self.canvas.grid(row=0, column=0, sticky="nsew")
+        circuit_v.grid(row=0, column=1, sticky="ns")
+        circuit_h.grid(row=1, column=0, sticky="ew")
+        circuit_box.rowconfigure(0, weight=1)
+        circuit_box.columnconfigure(0, weight=1)
         self.canvas.bind("<Configure>", self._schedule_redraw)
 
         self.cam_panel = ttk.LabelFrame(middle, text="USB Webcam Feed", padding=4, width=320)
@@ -1322,10 +1434,16 @@ class PhotonicCircuitSimulator(tk.Tk):
 
         ttk.Label(root, textvariable=self.stats_var, padding=(12, 2)).pack(fill="x")
 
+        wave_box = ttk.Frame(root)
+        wave_box.pack(fill="x", padx=10, pady=(0, 6))
         self.waveform = tk.Canvas(
-            root, background="#f7fafc", height=180, highlightthickness=1, highlightbackground="#d9e2e8"
+            wave_box, background="#f7fafc", height=180, highlightthickness=1, highlightbackground="#d9e2e8"
         )
-        self.waveform.pack(fill="x", padx=10, pady=(0, 6))
+        wave_h = ttk.Scrollbar(wave_box, orient="horizontal", command=self.waveform.xview)
+        self.waveform.configure(xscrollcommand=wave_h.set)
+        self.waveform.grid(row=0, column=0, sticky="ew")
+        wave_h.grid(row=1, column=0, sticky="ew")
+        wave_box.columnconfigure(0, weight=1)
         self.waveform.bind("<Configure>", self._schedule_redraw)
 
         # LLM controls are additive: retain the original circuit, lag analysis
@@ -1345,38 +1463,21 @@ class PhotonicCircuitSimulator(tk.Tk):
         prompt_row = ttk.Frame(llm_frame)
         prompt_row.pack(fill="x", pady=(5, 3))
         self.llm_prompt_text = tk.Text(prompt_row, height=4, wrap="word")
-        self.llm_prompt_text.pack(fill="x", expand=True)
+        prompt_scroll = ttk.Scrollbar(prompt_row, orient="vertical", command=self.llm_prompt_text.yview)
+        self.llm_prompt_text.configure(yscrollcommand=prompt_scroll.set)
+        prompt_scroll.pack(side="right", fill="y")
+        self.llm_prompt_text.pack(side="left", fill="x", expand=True)
         self.llm_prompt_text.insert("1.0", "Write a continuation based on the context.\n")
         self.llm_prompt_text.bind("<KeyRelease>", self.llm_update_prompt_bits)
-        self.llm_output_text = tk.Text(llm_frame, height=6, wrap="word", state="disabled")
-        self.llm_output_text.pack(fill="x", pady=(3, 0))
+        output_row = ttk.Frame(llm_frame)
+        output_row.pack(fill="x", pady=(3, 0))
+        self.llm_output_text = tk.Text(output_row, height=6, wrap="word", state="disabled")
+        output_scroll = ttk.Scrollbar(output_row, orient="vertical", command=self.llm_output_text.yview)
+        self.llm_output_text.configure(yscrollcommand=output_scroll.set)
+        output_scroll.pack(side="right", fill="y")
+        self.llm_output_text.pack(side="left", fill="x", expand=True)
         ttk.Label(llm_frame, textvariable=self.llm_token_status_var).pack(fill="x")
         self.llm_update_prompt_bits()
-
-        lag_frame = ttk.LabelFrame(
-            root, text="Lag sweep (autocorrelation): match rate vs lag, in input symbols", padding=6
-        )
-        lag_frame.pack(fill="x", padx=10, pady=(0, 10))
-
-        ctl = ttk.Frame(lag_frame)
-        ctl.pack(fill="x")
-        ttk.Label(ctl, text="Signal").pack(side="left", padx=4)
-        ttk.Combobox(
-            ctl, textvariable=self.lag_signal_var, values=list(self.LAG_SIGNALS.keys()),
-            state="readonly", width=18,
-        ).pack(side="left", padx=4)
-        ttk.Label(ctl, text="Max lag").pack(side="left", padx=(12, 4))
-        ttk.Entry(ctl, textvariable=self.max_lag_var, width=6).pack(side="left", padx=4)
-        ttk.Button(ctl, text="Analyse lags", command=self.analyse_lags).pack(side="left", padx=10)
-        ttk.Label(lag_frame, textvariable=self.lag_info_var, wraplength=1200, justify="left").pack(
-            fill="x", pady=(4, 2)
-        )
-
-        self.lag_canvas = tk.Canvas(
-            lag_frame, background="white", height=200, highlightthickness=1, highlightbackground="#d9e2e8"
-        )
-        self.lag_canvas.pack(fill="x", pady=(2, 0))
-        self.lag_canvas.bind("<Configure>", self._schedule_redraw)
 
     # ---------------------------------------------------------
     # Prompt bitstream + Q-clocked LLM
@@ -1742,8 +1843,6 @@ class PhotonicCircuitSimulator(tk.Tk):
             return
 
         self.playback_speed = cfg["speed"]
-        self.lag_result = None
-        self.lag_info_var.set("Lag sweep: run the simulation, then press Analyse lags.")
         self.model = PhotonicBenchModel(
             probe_duration=cfg["duration"],
             seed=cfg["seed"],
@@ -1762,6 +1861,7 @@ class PhotonicCircuitSimulator(tk.Tk):
             pattern_bits=self.pattern_var.get(),
             stream_text=self.text_var.get(),
             stream_noise=cfg["stream_noise"],
+            device=self.device,
         )
         self.llm_update_prompt_bits()
         self.model.prompt_bits = list(self.prompt_bits)
@@ -1806,7 +1906,6 @@ class PhotonicCircuitSimulator(tk.Tk):
 
         if self.model.finished:
             self.pause()
-            self.analyse_lags()
             return
 
         delay_ms = max(1, round(1000 * self.model.DT / max(0.01, self.playback_speed)))
@@ -1827,99 +1926,6 @@ class PhotonicCircuitSimulator(tk.Tk):
         while not self.model.finished:
             self._step_once()
         self.redraw()
-        self.analyse_lags()
-
-    # ---------------------------------------------------------
-    # Lag sweep
-    # ---------------------------------------------------------
-
-    def analyse_lags(self):
-        m = self.model
-        if m is None or not m.records:
-            self.lag_info_var.set("Lag sweep: no data yet. Run or step the simulation first.")
-            return
-        try:
-            max_lag = int(self.max_lag_var.get())
-            if max_lag < 1:
-                raise ValueError
-        except ValueError:
-            messagebox.showerror("Invalid max lag", "Max lag must be a positive integer.")
-            return
-
-        key = self.LAG_SIGNALS.get(self.lag_signal_var.get(), "optical_x")
-        bits = m.symbol_samples(key)
-        res = lag_sweep(bits, max_lag)
-        res["key"] = key
-        self.lag_result = res
-
-        step_per_sym = m.input_steps
-        if not res["rows"]:
-            self.lag_info_var.set(f"Lag sweep: only {res['n']} symbols so far, need at least 6.")
-        else:
-            pk = res["peak"]
-            msg = (
-                f"{self.lag_signal_var.get()}: n={res['n']} symbols | chance baseline={res['baseline']:.3f} | "
-                f"significance line (z=4)={res['sig_rate']:.3f} | "
-                f"peak lag {pk[0]} ({pk[0] * step_per_sym} steps, {pk[0] * m.INPUT_PERIOD * 1000:.0f} ms) "
-                f"rate={pk[1]:.3f} z={pk[2]:.1f}"
-            )
-            per = res["period"]
-            if per is not None:
-                msg += (
-                    f" | DETECTED REPEAT PERIOD = {per[0]} symbols "
-                    f"(set Queue len to {per[0] * step_per_sym} steps to align the hardware probe)"
-                )
-            else:
-                msg += " | no significant repeat detected"
-            self.lag_info_var.set(msg)
-        self.redraw()
-
-    def _draw_lag_chart(self):
-        c = self.lag_canvas
-        c.delete("all")
-        res = self.lag_result
-        w = max(300, c.winfo_width())
-        h = max(120, c.winfo_height())
-        left, right, top, bottom = 50, w - 15, 14, h - 26
-        plot_w = max(10, right - left)
-        plot_h = max(10, bottom - top)
-
-        c.create_rectangle(left, top, right, bottom, outline="#d4dde5")
-        for frac in (0.0, 0.5, 1.0):
-            y = bottom - plot_h * frac
-            c.create_text(left - 6, y, text=f"{frac:.1f}", anchor="e", font=("Arial", 8), fill="#34495e")
-
-        if not res or not res["rows"]:
-            c.create_text(w / 2, h / 2, text="No lag sweep yet", fill="#82919e")
-            return
-
-        rows = res["rows"]
-        n_bars = len(rows)
-        bar_w = plot_w / n_bars
-        per_lag = res["period"][0] if res["period"] else None
-
-        for i, (lag, rate, z) in enumerate(rows):
-            x0 = left + i * bar_w
-            y0 = bottom - plot_h * rate
-            sig = z >= 4.0
-            color = "#bd4258" if sig else "#9fb3c2"
-            if per_lag is not None and lag == per_lag:
-                color = "#12805c"
-            c.create_rectangle(x0 + 0.5, y0, x0 + max(1.0, bar_w - 0.5), bottom, fill=color, outline="")
-
-        base_y = bottom - plot_h * res["baseline"]
-        sig_y = bottom - plot_h * res["sig_rate"]
-        c.create_line(left, base_y, right, base_y, fill="#34495e", dash=(4, 3))
-        c.create_text(right - 2, base_y - 7, text="chance", anchor="e", font=("Arial", 8), fill="#34495e")
-        c.create_line(left, sig_y, right, sig_y, fill="#b36a20", dash=(2, 3))
-        c.create_text(left + 4, sig_y - 7, text="z = 4", anchor="w", font=("Arial", 8), fill="#b36a20")
-
-        tick_every = max(1, n_bars // 16)
-        for i, (lag, _r, _z) in enumerate(rows):
-            if lag == 1 or lag % tick_every == 0:
-                x = left + (i + 0.5) * bar_w
-                c.create_text(x, bottom + 11, text=str(lag), font=("Arial", 8), fill="#34495e")
-        c.create_text(right, h - 3, text="lag (symbols)", anchor="e", font=("Arial", 8), fill="#34495e")
 
     # ---------------------------------------------------------
     # Drawing
@@ -1936,7 +1942,6 @@ class PhotonicCircuitSimulator(tk.Tk):
             return
         self._draw_circuit()
         self._draw_waveforms()
-        self._draw_lag_chart()
         self._update_status()
 
     def _section(self, x, y, w, h, title):
@@ -1966,10 +1971,7 @@ class PhotonicCircuitSimulator(tk.Tk):
         c.create_text(x + 37, y + 23, text=name, font=("Arial", 10, "bold"), fill="#203040")
 
     def _format_queue_preview(self, m: PhotonicBenchModel) -> str:
-        bits = "".join(str(bit) for bit in m.d_bit_queue)
-        if len(bits) > 12:
-            bits = bits[:6] + ".." + bits[-4:]
-        return f"[{bits}] ({len(m.d_bit_queue)}/{m.d_queue_length})"
+        return m.queue_preview()
 
     def _draw_circuit(self):
         m = self.model
@@ -2090,9 +2092,10 @@ class PhotonicCircuitSimulator(tk.Tk):
         )
         self._wire([820, 538, 850, 538])
 
-        w = max(1, c.winfo_width())
-        h = max(1, c.winfo_height())
+        w = max(self.CIRCUIT_MIN_W, c.winfo_width())
+        h = max(self.CIRCUIT_MIN_H, c.winfo_height())
         c.scale("all", 0, 0, w / 1160, h / 590)
+        c.configure(scrollregion=(0, 0, w, h))
 
     def _draw_waveforms(self):
         m = self.model
@@ -2100,7 +2103,8 @@ class PhotonicCircuitSimulator(tk.Tk):
         p = self.waveform
         p.delete("all")
 
-        w = max(600, p.winfo_width())
+        w = max(self.WAVE_MIN_W, p.winfo_width())
+        p.configure(scrollregion=(0, 0, w, 180))
         left = 115
         right = w - 25
         plot_w = max(10, right - left)
