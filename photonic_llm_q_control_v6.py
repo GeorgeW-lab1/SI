@@ -745,8 +745,8 @@ class PhotonicBenchModel:
     RC_TAU = 0.050
     SUPPLY = 5.0
     THRESHOLD = 0.7
-    AND_DELAY = 0.150
-    CLOCK_PERIOD = 0.100
+    AND_DELAY = 0.050
+    CLOCK_PERIOD = 0.0000100
     INPUT_PERIOD = 0.100
 
     def __init__(
