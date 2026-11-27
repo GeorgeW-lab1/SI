@@ -114,6 +114,90 @@ def parse_bitstring(s: str) -> list[int]:
     return bits or [1]
 
 
+# ---------------------------------------------------------------------------
+# Exact convex-geometry predicates (deterministic)
+#
+# Non-deterministic methods leave the outcome of geometric operations uncertain.
+# In a CONVEX polygon the predicates below are exact sign tests on integer
+# cross products: no randomness, no tolerance, same answer every call. Pixel
+# coordinates are ints, so Python's arbitrary-precision arithmetic is exact.
+# A non-convex polygon voids those guarantees, so it is rejected up front.
+# ---------------------------------------------------------------------------
+
+def cross2(o, a, b) -> int:
+    """z-component of (a - o) x (b - o)."""
+    return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+
+
+def side_of_line(a, b, p) -> int:
+    """+1 / -1 for the two sides of directed line a->b, 0 if p is exactly on it."""
+    c = cross2(a, b, p)
+    return (c > 0) - (c < 0)
+
+
+def same_side(a, b, p, q) -> bool:
+    """True iff p and q lie strictly on the same side of line a-b."""
+    sp = side_of_line(a, b, p)
+    return sp != 0 and sp == side_of_line(a, b, q)
+
+
+def _sign_changes(values) -> int:
+    nz = [v for v in values if v != 0]
+    return sum(1 for i in range(len(nz)) if nz[i] != nz[i - 1]) if len(nz) > 1 else 0
+
+
+def is_convex_polygon(poly) -> bool:
+    """Non-convexity check: every turn has the same sign and the outline
+    winds once (rejects self-intersecting stars as well as concave shapes)."""
+    n = len(poly)
+    if n < 3:
+        return False
+    sign = 0
+    for i in range(n):
+        c = cross2(poly[i], poly[(i + 1) % n], poly[(i + 2) % n])
+        s = (c > 0) - (c < 0)
+        if s == 0:
+            continue
+        if sign == 0:
+            sign = s
+        elif s != sign:
+            return False
+    if sign == 0:
+        return False
+    dx = [poly[(i + 1) % n][0] - poly[i][0] for i in range(n)]
+    dy = [poly[(i + 1) % n][1] - poly[i][1] for i in range(n)]
+    return _sign_changes(dx) <= 2 and _sign_changes(dy) <= 2
+
+
+def point_in_convex_polygon(poly, p) -> bool:
+    """Boundary-inclusive membership: p is on the inner side of every edge."""
+    n = len(poly)
+    orient = 1 if sum(cross2(poly[0], poly[i], poly[i + 1]) for i in range(1, n - 1)) > 0 else -1
+    return all(side_of_line(poly[i], poly[(i + 1) % n], p) * orient >= 0 for i in range(n))
+
+
+def convex_polygon_mask(poly, width: int, height: int):
+    """Boolean (height, width) mask of integer pixels inside a convex polygon,
+    built from the same exact edge sign test as point_in_convex_polygon."""
+    import numpy as np
+    ys, xs = np.mgrid[0:height, 0:width].astype(np.int64)
+    n = len(poly)
+    orient = 1 if sum(cross2(poly[0], poly[i], poly[i + 1]) for i in range(1, n - 1)) > 0 else -1
+    mask = np.ones((height, width), dtype=bool)
+    for i in range(n):
+        a, b = poly[i], poly[(i + 1) % n]
+        c = (b[0] - a[0]) * (ys - a[1]) - (b[1] - a[1]) * (xs - a[0])
+        mask &= (c * orient) >= 0
+    return mask
+
+
+def box_to_polygon(box, width: int, height: int):
+    """Normalised (x1, y1, x2, y2) box -> integer pixel polygon (convex, 4 vertices)."""
+    x1, y1 = int(box[0] * width), int(box[1] * height)
+    x2, y2 = int(box[2] * width), int(box[3] * height)
+    return [(x1, y1), (x2, y1), (x2, y2), (x1, y2)]
+
+
 def lag_sweep(bits: list[int], max_lag: int, z_threshold: float = 4.0, lags=None) -> dict:
     """
     Autocorrelation for binary streams.
@@ -1300,6 +1384,10 @@ class PhotonicCircuitSimulator(tk.Tk):
 
     def __init__(self):
         super().__init__()
+        # ROIs must be convex for the exact same-side / containment tests to hold.
+        for name, box in (("ROI_A", self.ROI_A), ("ROI_B", self.ROI_B)):
+            if not is_convex_polygon(box_to_polygon(box, 1000, 1000)):
+                raise ValueError(f"{name} is not a convex polygon; geometry tests are not exact.")
         self.title("Photonic & Modal Logic Pattern Recogniser — Q-clocked LLM")
         self.geometry("1380x1060")
         self.minsize(960, 620)
@@ -1705,10 +1793,7 @@ class PhotonicCircuitSimulator(tk.Tk):
                     self.llm_status_var.set("LLM error: " + data.get("message", "unknown"))
             elif (kind == "token" and data.get("session_id") == self.llm_session_id
                   and self.llm_session_active):
-                self.llm_output_text.configure(state="normal")
-                self.llm_output_text.delete("1.0", "end")
-                self.llm_output_text.insert("1.0", data.get("text", ""))
-                self.llm_output_text.configure(state="disabled")
+                self._llm_set_output(data.get("text", ""))
                 self.llm_token_records.append(data)
                 self.llm_token_status_var.set(
                     f"Tokens: {data.get('count', 0)} | {data.get('mode')} | "
@@ -1726,6 +1811,24 @@ class PhotonicCircuitSimulator(tk.Tk):
                     self.llm_status_var.set("Generation finished")
         self.llm_dispatch_start()
         self.llm_dispatch_pending()
+
+    def _llm_set_output(self, text):
+        """Replace the output text without disturbing the reader's scroll position.
+
+        Follows the tail only if the view was already at the bottom; otherwise the
+        same top line stays in place while new tokens arrive.
+        """
+        w = self.llm_output_text
+        at_bottom = w.yview()[1] >= 0.999
+        top_line = w.index("@0,0")
+        w.configure(state="normal")
+        w.delete("1.0", "end")
+        w.insert("1.0", text)
+        w.configure(state="disabled")
+        if at_bottom:
+            w.yview_moveto(1.0)
+        else:
+            w.yview(top_line)
 
     def llm_request_from_q(self):
         if not self.llm_session_active or self.model is None:
@@ -1825,29 +1928,30 @@ class PhotonicCircuitSimulator(tk.Tk):
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         h, w = gray.shape[:2]
 
-        def slice_roi(box):
-            x1, y1, x2, y2 = int(box[0] * w), int(box[1] * h), int(box[2] * w), int(box[3] * h)
-            return x1, y1, x2, y2, gray[y1:y2, x1:x2]
+        poly_a = box_to_polygon(self.ROI_A, w, h)
+        poly_b = box_to_polygon(self.ROI_B, w, h)
 
-        ax1, ay1, ax2, ay2, reg_a = slice_roi(self.ROI_A)
-        bx1, by1, bx2, by2, reg_b = slice_roi(self.ROI_B)
+        def roi_mean(poly):
+            mask = convex_polygon_mask(poly, w, h)
+            return float(gray[mask].mean()) if mask.any() else 0.0
 
-        self.brightness_a = float(reg_a.mean()) if reg_a.size else 0.0
-        self.brightness_b = float(reg_b.mean()) if reg_b.size else 0.0
+        self.brightness_a = roi_mean(poly_a)
+        self.brightness_b = roi_mean(poly_b)
 
         thresh = float(self.cam_thresh_var.get())
         self.detector_a = int(self.brightness_a >= thresh)
         self.detector_b = int(self.brightness_b >= thresh)
 
         vis = frame.copy()
-        for label, (x1, y1, x2, y2), state, bright in [
-            ("A", (ax1, ay1, ax2, ay2), self.detector_a, self.brightness_a),
-            ("B", (bx1, by1, bx2, by2), self.detector_b, self.brightness_b),
+        import numpy as np
+        for label, poly, state, bright in [
+            ("A", poly_a, self.detector_a, self.brightness_a),
+            ("B", poly_b, self.detector_b, self.brightness_b),
         ]:
             col = (40, 210, 40) if state else (50, 80, 230)
-            cv2.rectangle(vis, (x1, y1), (x2, y2), col, 2)
+            cv2.polylines(vis, [np.array(poly, dtype=np.int32)], True, col, 2)
             cv2.putText(
-                vis, f"{label}: {bright:.0f}->{state}", (x1, max(18, y1 - 6)),
+                vis, f"{label}: {bright:.0f}->{state}", (poly[0][0], max(18, poly[0][1] - 6)),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, col, 2
             )
 
