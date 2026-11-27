@@ -1438,11 +1438,11 @@ class PhotonicCircuitSimulator(tk.Tk):
         self.duration_var = tk.StringVar(value="60.0")
         self.speed_var = tk.StringVar(value="10.0")
         self.seed_var = tk.StringVar(value="7")
-        self.queue_len_var = tk.StringVar(value="320")
+        self.queue_len_var = tk.StringVar(value="3200")
         self.mode_var = tk.StringVar(value="Repeating bits")
         self.manual_x_var = tk.BooleanVar(value=False)
         self.ignore_startup_var = tk.BooleanVar(value=False)
-        self.feedback_driver_a_var = tk.BooleanVar(value=False)
+        self.feedback_driver_a_var = tk.BooleanVar(value=True)
 
         self.pattern_var = tk.StringVar(value="1101001")
         self.text_var = tk.StringVar(value="the cat sat on the mat. ")
